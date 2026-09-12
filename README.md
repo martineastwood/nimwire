@@ -10,6 +10,11 @@ The first release targets the stable MCP `2026-07-28` revision over stdio:
 - sync and async tool handlers;
 - a small declarative `mcpServer` template/macro API.
 
+The implementation is split into focused modules. Import `nimwire/core` for
+protocol primitives, `nimwire/server` for registration and dispatch, and
+`nimwire/transports/stdio` for the stdio transport. `nimwire/testing` provides
+in-process request helpers.
+
 Build the example:
 
 ```sh

@@ -1,15 +1,6 @@
 import std/[json, unittest]
 import ../src/nimwire
 
-proc modernRequest(id: int, methodName: string,
-                   params: JsonNode = newJObject()): JsonNode =
-  var body = if params.isNil: newJObject() else: params
-  body["_meta"] = %*{
-    "io.modelcontextprotocol/protocolVersion": mcpProtocolVersion,
-    "io.modelcontextprotocol/clientCapabilities": {}
-  }
-  %*{"jsonrpc": "2.0", "id": id, "method": methodName, "params": body}
-
 suite "nimwire MCP server":
   let server = mcpServer("test-server", "1.0.0"):
     server.addTool mcpTool("echo", "Echo text", %*{
