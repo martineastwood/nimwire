@@ -10,6 +10,7 @@ const
   mcpMethodNotFoundCode* = -32601
   mcpInvalidParamsCode* = -32602
   mcpInternalErrorCode* = -32603
+  mcpRequestCancelledCode* = -32800
   mcpHeaderMismatchCode* = -32020
   mcpUnsupportedProtocolVersionCode* = -32022
   mcpDefaultMaxMessageBytes* = 1024 * 1024

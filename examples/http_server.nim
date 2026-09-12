@@ -7,7 +7,8 @@ let app = mcpServer("http-example", "1.0.0"):
     "type": "object",
     "properties": {"text": {"type": "string"}},
     "required": ["text"]
-  }, proc (args: JsonNode): McpToolResult = textResult(args["text"].getStr))
+  }, proc (args: JsonNode, ignoredContext: McpContext): McpToolResult =
+    textResult(args["text"].getStr))
 
 let http = newMcpHttpServer(app, newMcpHttpConfig(
   endpoint = "/mcp", host = "127.0.0.1", port = Port(8080),

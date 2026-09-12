@@ -3,31 +3,51 @@
 import std/[algorithm, asyncdispatch, base64, json, macros, options, strutils]
 
 import ./core
+import ./context
+import ./prompts
+import ./resources
 import ./schema
 
 type
-  McpToolHandler* = proc (arguments: JsonNode): Future[McpToolResult] {.closure.}
-  McpSyncToolHandler* = proc (arguments: JsonNode): McpToolResult {.closure.}
+  McpToolHandler* = proc (arguments: JsonNode,
+                          context: McpContext): Future[McpToolResult] {.closure.}
+  McpSyncToolHandler* = proc (arguments: JsonNode,
+                              context: McpContext): McpToolResult {.closure.}
+  McpResourceNotificationHandler* = proc (message: JsonNode) {.closure.}
+
+  McpResourceSubscription* = ref object
+    id*: McpId
+    resourcesListChanged*: bool
+    resourceUris*: seq[string]
+    handler: McpResourceNotificationHandler
 
   McpTool* = object
-    name*: string
-    description*: string
-    inputSchema*: JsonNode
-    outputSchema*: JsonNode
-    title*: string
-    icons*: JsonNode
-    annotations*: JsonNode
-    handler*: McpToolHandler
+    name: string
+    description: string
+    inputSchema: JsonNode
+    outputSchema: JsonNode
+    title: string
+    icons: JsonNode
+    annotations: JsonNode
+    handler: McpToolHandler
+    headerBindings: seq[McpHeaderBinding]
 
   McpServer* = ref object
-    name*: string
-    version*: string
-    instructions*: string
-    listTtlMs*: int
-    listCacheScope*: string
-    listPageSize*: int
-    toolsListChanged*: bool
-    tools*: seq[McpTool]
+    name: string
+    version: string
+    instructions: string
+    listTtlMs: int
+    listCacheScope: string
+    listPageSize: int
+    toolsListChanged: bool
+    tools: seq[McpTool]
+    resourcesListChanged: bool
+    resourcesSubscribe: bool
+    resources: seq[McpResource]
+    resourceTemplates: seq[McpResourceTemplate]
+    resourceSubscriptions: seq[McpResourceSubscription]
+    promptsListChanged: bool
+    prompts: seq[McpPrompt]
 
 proc newMcpServer*(name, version: string, instructions = "",
                    listTtlMs = 0, listCacheScope = "private",
@@ -42,21 +62,26 @@ proc newMcpServer*(name, version: string, instructions = "",
     listTtlMs: listTtlMs, listCacheScope: listCacheScope,
     listPageSize: listPageSize)
 
+proc validateToolDefinition(name, description: string, inputSchema,
+                            outputSchema, icons, annotations: JsonNode):
+    seq[McpHeaderBinding] =
+  validateToolName(name)
+  if description.len == 0: raise newMcpError("tool description must not be empty")
+  result = mcpHeaderBindings(inputSchema)
+  if not outputSchema.isNil:
+    discard requireJsonSchema(outputSchema, "tool outputSchema")
+  validateToolPresentation(icons, annotations)
+
 proc newMcpTool*(name, description: string, inputSchema: JsonNode,
                  handler: McpToolHandler,
                  outputSchema: JsonNode = nil, title = "",
                  icons: JsonNode = nil, annotations: JsonNode = nil): McpTool =
-  validateToolName(name)
-  if description.len == 0: raise newMcpError("tool description must not be empty")
-  discard requireJsonSchema(inputSchema, "tool inputSchema")
-  if not outputSchema.isNil:
-    discard requireJsonSchema(outputSchema, "tool outputSchema")
-  discard mcpHeaderBindings(inputSchema)
-  validateToolPresentation(icons, annotations)
+  let headerBindings = validateToolDefinition(name, description, inputSchema,
+    outputSchema, icons, annotations)
   if handler.isNil: raise newMcpError("tool handler must not be nil")
   McpTool(name: name, description: description, inputSchema: inputSchema,
     outputSchema: outputSchema, title: title, icons: icons,
-    annotations: annotations, handler: handler)
+    annotations: annotations, handler: handler, headerBindings: headerBindings)
 
 proc newMcpTool*(name, description: string, inputSchema: JsonNode,
                  handler: McpSyncToolHandler,
@@ -64,8 +89,8 @@ proc newMcpTool*(name, description: string, inputSchema: JsonNode,
                  icons: JsonNode = nil, annotations: JsonNode = nil): McpTool =
   if handler.isNil: raise newMcpError("tool handler must not be nil")
   newMcpTool(name, description, inputSchema,
-    proc (arguments: JsonNode): Future[McpToolResult] {.async.} =
-      handler(arguments), outputSchema, title, icons, annotations)
+    proc (arguments: JsonNode, context: McpContext): Future[McpToolResult] {.async.} =
+      handler(arguments, context), outputSchema, title, icons, annotations)
 
 template mcpTool*(name, description: string, inputSchema: JsonNode,
                   handler: untyped, outputSchema: JsonNode = nil,
@@ -90,6 +115,184 @@ proc addTool*(server: McpServer, tool: McpTool) =
     if current.name == tool.name:
       raise newMcpError("duplicate tool name: " & tool.name)
   server.tools.add tool
+
+proc resourceNotification(subscription: McpResourceSubscription,
+                          methodName, uri: string): JsonNode =
+  var params = newJObject()
+  params["_meta"] = newJObject()
+  params["_meta"]["io.modelcontextprotocol/subscriptionId"] =
+    toJson(subscription.id)
+  if uri.len > 0: params["uri"] = %uri
+  %*{"jsonrpc": mcpJsonRpcVersion, "method": methodName,
+    "params": params}
+
+proc emitResourceListChanged(server: McpServer) =
+  for subscription in server.resourceSubscriptions:
+    if subscription.resourcesListChanged and not subscription.handler.isNil:
+      try:
+        subscription.handler(resourceNotification(subscription,
+          "notifications/resources/list_changed", ""))
+      except CatchableError:
+        discard
+
+proc emitResourceUpdated(server: McpServer, uri: string) =
+  for subscription in server.resourceSubscriptions:
+    if uri in subscription.resourceUris and not subscription.handler.isNil:
+      try:
+        subscription.handler(resourceNotification(subscription,
+          "notifications/resources/updated", uri))
+      except CatchableError:
+        discard
+
+proc subscribeResources*(server: McpServer, subscriptionId: McpId,
+                         handler: McpResourceNotificationHandler,
+                         resourcesListChanged = false,
+                         resourceUris: seq[string] = @[]):
+                         McpResourceSubscription =
+  if server.isNil: raise newMcpError("server must not be nil")
+  if subscriptionId.kind == mcpNullId:
+    raise newMcpError("resource subscription id must not be null")
+  if handler.isNil: raise newMcpError("resource subscription handler must not be nil")
+  for uri in resourceUris:
+    validateResourceUri(uri, "resource subscription")
+  result = McpResourceSubscription(id: subscriptionId,
+    resourcesListChanged: resourcesListChanged, resourceUris: resourceUris,
+    handler: handler)
+  server.resourceSubscriptions.add result
+  server.resourcesSubscribe = true
+
+proc unsubscribeResources*(server: McpServer,
+                           subscription: McpResourceSubscription): bool =
+  if server.isNil or subscription.isNil: return false
+  for index in countdown(server.resourceSubscriptions.high, 0):
+    if server.resourceSubscriptions[index] == subscription:
+      server.resourceSubscriptions.delete(index)
+      return true
+  false
+
+proc markResourcesChanged*(server: McpServer) =
+  if server.isNil: raise newMcpError("server must not be nil")
+  server.resourcesListChanged = true
+  server.emitResourceListChanged()
+
+proc markResourceUpdated*(server: McpServer, uri: string) =
+  if server.isNil: raise newMcpError("server must not be nil")
+  validateResourceUri(uri, "resource")
+  server.emitResourceUpdated(uri)
+
+proc notifyResourceListChanged*(server: McpServer) =
+  server.markResourcesChanged()
+
+proc notifyResourceUpdated*(server: McpServer, uri: string) =
+  server.markResourceUpdated(uri)
+
+proc addResource*(server: McpServer, resource: McpResource) =
+  if server.isNil: raise newMcpError("server must not be nil")
+  validateResourceUri(resource.uri)
+  if resource.name.len == 0:
+    raise newMcpError("resource name must not be empty")
+  if resource.size < -1:
+    raise newMcpError("resource size must be non-negative")
+  for content in resource.contents:
+    discard resourceContentJson(content, resource.mimeType)
+  for current in server.resources:
+    if current.uri == resource.uri:
+      raise newMcpError("duplicate resource URI: " & resource.uri)
+  server.resources.add resource
+
+proc addResourceTemplate*(server: McpServer,
+                          resourceTemplate: McpResourceTemplate) =
+  if server.isNil: raise newMcpError("server must not be nil")
+  validateUriTemplate(resourceTemplate.uriTemplate)
+  if resourceTemplate.name.len == 0:
+    raise newMcpError("resource template name must not be empty")
+  for current in server.resourceTemplates:
+    if current.uriTemplate == resourceTemplate.uriTemplate:
+      raise newMcpError("duplicate resource URI template: " &
+        resourceTemplate.uriTemplate)
+  server.resourceTemplates.add resourceTemplate
+
+proc addResourceTemplateCompletion*(server: McpServer, uriTemplate,
+                                    argument: string,
+                                    handler: McpResourceCompletionHandler) =
+  if server.isNil: raise newMcpError("server must not be nil")
+  for index in 0 ..< server.resourceTemplates.len:
+    if server.resourceTemplates[index].uriTemplate == uriTemplate:
+      server.resourceTemplates[index].addCompletion(argument, handler)
+      return
+  raise newMcpError("unknown resource URI template: " & uriTemplate)
+
+proc addResourceTemplateCompletion*(server: McpServer, uriTemplate,
+                                    argument: string,
+                                    handler: McpSyncResourceCompletionHandler) =
+  if server.isNil: raise newMcpError("server must not be nil")
+  for index in 0 ..< server.resourceTemplates.len:
+    if server.resourceTemplates[index].uriTemplate == uriTemplate:
+      server.resourceTemplates[index].addCompletion(argument, handler)
+      return
+  raise newMcpError("unknown resource URI template: " & uriTemplate)
+
+proc findResource*(server: McpServer, uri: string): int =
+  for index, resource in server.resources:
+    if resource.uri == uri: return index
+  -1
+
+proc findResourceTemplate*(server: McpServer, uriTemplate: string): int =
+  for index, resourceTemplate in server.resourceTemplates:
+    if resourceTemplate.uriTemplate == uriTemplate: return index
+  -1
+
+proc addPrompt*(server: McpServer, prompt: McpPrompt) =
+  if server.isNil: raise newMcpError("server must not be nil")
+  if prompt.name.len == 0:
+    raise newMcpError("prompt name must not be empty")
+  for current in server.prompts:
+    if current.name == prompt.name:
+      raise newMcpError("duplicate prompt name: " & prompt.name)
+  server.prompts.add prompt
+
+proc findPrompt*(server: McpServer, name: string): int =
+  for index, prompt in server.prompts:
+    if prompt.name == name: return index
+  -1
+
+proc addPromptCompletion*(server: McpServer, promptName, argument: string,
+                          handler: McpPromptCompletionHandler) =
+  if server.isNil: raise newMcpError("server must not be nil")
+  let index = server.findPrompt(promptName)
+  if index < 0:
+    raise newMcpError("unknown prompt: " & promptName)
+  server.prompts[index].addCompletion(argument, handler)
+
+proc addPromptCompletion*(server: McpServer, promptName, argument: string,
+                          handler: McpSyncPromptCompletionHandler) =
+  if handler.isNil: raise newMcpError("prompt completion handler must not be nil")
+  server.addPromptCompletion(promptName, argument,
+    proc (completionArgument, prefix: string, context: McpContext):
+        Future[seq[string]] {.async.} =
+      handler(completionArgument, prefix, context))
+
+proc completePromptArgument*(server: McpServer, promptName, argument, prefix: string,
+                             context: McpContext): Future[seq[string]] {.async.} =
+  if server.isNil: raise newMcpError("server must not be nil")
+  let index = server.findPrompt(promptName)
+  if index < 0:
+    raise newMcpError("unknown prompt: " & promptName)
+  await server.prompts[index].completePromptArgument(argument, prefix, context)
+
+proc markPromptsChanged*(server: McpServer) =
+  if server.isNil: raise newMcpError("server must not be nil")
+  server.promptsListChanged = true
+
+proc completeResourceTemplate*(server: McpServer, uriTemplate, argument,
+                               prefix: string,
+                               context: McpContext): Future[seq[string]] {.async.} =
+  if server.isNil: raise newMcpError("server must not be nil")
+  let index = server.findResourceTemplate(uriTemplate)
+  if index < 0:
+    raise newMcpError("unknown resource URI template: " & uriTemplate)
+  await server.resourceTemplates[index].completeResourceTemplate(argument,
+    prefix, context)
 
 proc markToolsChanged*(server: McpServer) =
   if server.isNil: raise newMcpError("server must not be nil")
@@ -118,6 +321,15 @@ proc toolJson(tool: McpTool): JsonNode =
   if not tool.annotations.isNil:
     result["annotations"] = tool.annotations
 
+proc resourceJson(resource: McpResource): JsonNode =
+  toJson(resource)
+
+proc resourceTemplateJson(resourceTemplate: McpResourceTemplate): JsonNode =
+  toJson(resourceTemplate)
+
+proc promptJson(prompt: McpPrompt): JsonNode =
+  toJson(prompt)
+
 proc encodeToolsCursor(index: int): string =
   encode("nimwire.tools.list.v1:" & $index)
 
@@ -132,6 +344,102 @@ proc decodeToolsCursor(cursor: string, toolCount: int): int =
     raise newMcpError("tools/list cursor is invalid")
   if result < 0 or result > toolCount:
     raise newMcpError("tools/list cursor is out of range")
+
+proc encodeResourceCursor(index: int): string =
+  encode("nimwire.resources.list.v1:" & $index)
+
+proc decodeResourceCursor(cursor, prefix: string, itemCount: int): int =
+  try:
+    let decoded = decode(cursor)
+    if decoded.len <= prefix.len or not decoded.startsWith(prefix):
+      raise newException(ValueError, "prefix")
+    result = parseInt(decoded[prefix.len .. ^1])
+  except CatchableError:
+    raise newMcpError("resource list cursor is invalid")
+  if result < 0 or result > itemCount:
+    raise newMcpError("resource list cursor is out of range")
+
+proc listResources(server: McpServer, params: McpParams): McpResult =
+  var fields = resultObject(server).fields
+  var resources = server.resources
+  resources.sort(proc (a, b: McpResource): int = cmp(a.uri, b.uri))
+  let start = if "cursor" in params.values:
+    if params.values["cursor"].kind != JString or
+        params.values["cursor"].getStr.len == 0:
+      raise newMcpError("resources/list cursor must be a non-empty string")
+    decodeResourceCursor(params.values["cursor"].getStr,
+      "nimwire.resources.list.v1:", resources.len)
+  else:
+    0
+  let finish = if server.listPageSize == 0:
+    resources.len
+  else:
+    min(resources.len, start + server.listPageSize)
+  fields["resources"] = newJArray()
+  for index in start ..< finish:
+    fields["resources"].add resourceJson(resources[index])
+  if finish < resources.len:
+    fields["nextCursor"] = %encodeResourceCursor(finish)
+  fields["ttlMs"] = %server.listTtlMs
+  fields["cacheScope"] = %server.listCacheScope
+  newMcpResult(mcpComplete, fields)
+
+proc encodeResourceTemplateCursor(index: int): string =
+  encode("nimwire.resources.templates.list.v1:" & $index)
+
+proc listResourceTemplates(server: McpServer, params: McpParams): McpResult =
+  var fields = resultObject(server).fields
+  var templates = server.resourceTemplates
+  templates.sort(proc (a, b: McpResourceTemplate): int =
+    cmp(a.uriTemplate, b.uriTemplate))
+  let start = if "cursor" in params.values:
+    if params.values["cursor"].kind != JString or
+        params.values["cursor"].getStr.len == 0:
+      raise newMcpError("resources/templates/list cursor must be a non-empty string")
+    decodeResourceCursor(params.values["cursor"].getStr,
+      "nimwire.resources.templates.list.v1:", templates.len)
+  else:
+    0
+  let finish = if server.listPageSize == 0:
+    templates.len
+  else:
+    min(templates.len, start + server.listPageSize)
+  fields["resourceTemplates"] = newJArray()
+  for index in start ..< finish:
+    fields["resourceTemplates"].add resourceTemplateJson(templates[index])
+  if finish < templates.len:
+    fields["nextCursor"] = %encodeResourceTemplateCursor(finish)
+  fields["ttlMs"] = %server.listTtlMs
+  fields["cacheScope"] = %server.listCacheScope
+  newMcpResult(mcpComplete, fields)
+
+proc encodePromptCursor(index: int): string =
+  encode("nimwire.prompts.list.v1:" & $index)
+
+proc listPrompts(server: McpServer, params: McpParams): McpResult =
+  var fields = resultObject(server).fields
+  var prompts = server.prompts
+  prompts.sort(proc (a, b: McpPrompt): int = cmp(a.name, b.name))
+  let start = if "cursor" in params.values:
+    if params.values["cursor"].kind != JString or
+        params.values["cursor"].getStr.len == 0:
+      raise newMcpError("prompts/list cursor must be a non-empty string")
+    decodeResourceCursor(params.values["cursor"].getStr,
+      "nimwire.prompts.list.v1:", prompts.len)
+  else:
+    0
+  let finish = if server.listPageSize == 0:
+    prompts.len
+  else:
+    min(prompts.len, start + server.listPageSize)
+  fields["prompts"] = newJArray()
+  for index in start ..< finish:
+    fields["prompts"].add promptJson(prompts[index])
+  if finish < prompts.len:
+    fields["nextCursor"] = %encodePromptCursor(finish)
+  fields["ttlMs"] = %server.listTtlMs
+  fields["cacheScope"] = %server.listCacheScope
+  newMcpResult(mcpComplete, fields)
 
 proc listTools(server: McpServer, params: McpParams): McpResult =
   var fields = resultObject(server).fields
@@ -163,6 +471,16 @@ proc discover(server: McpServer): McpResult =
   fields["capabilities"] = %*{"tools": {
     "listChanged": server.toolsListChanged
   }}
+  if server.resources.len > 0 or server.resourceTemplates.len > 0:
+    let resources = %*{
+      "listChanged": server.resourcesListChanged,
+      "subscribe": server.resourcesSubscribe
+    }
+    fields["capabilities"]["resources"] = resources
+  if server.prompts.len > 0:
+    fields["capabilities"]["prompts"] = %*{
+      "listChanged": server.promptsListChanged
+    }
   if server.instructions.len > 0:
     fields["instructions"] = %server.instructions
   newMcpResult(mcpComplete, fields)
@@ -172,7 +490,16 @@ proc findTool*(server: McpServer, name: string): int =
     if tool.name == name: return i
   -1
 
-proc callTool(server: McpServer, params: McpParams): Future[McpResult] {.async.} =
+iterator toolHeaderBindings*(server: McpServer,
+                             name: string): McpHeaderBinding =
+  let index = server.findTool(name)
+  if index >= 0:
+    for binding in server.tools[index].headerBindings:
+      yield binding
+
+proc callTool(server: McpServer, params: McpParams,
+              context: McpContext): Future[McpResult] {.async.} =
+  context.checkCancelled()
   let name = requiredString(params.values, "name", "tools/call params")
   let arguments = if "arguments" in params.values:
     requireObject(params.values["arguments"], "tools/call arguments")
@@ -183,7 +510,8 @@ proc callTool(server: McpServer, params: McpParams): Future[McpResult] {.async.}
     raise newMcpError("unknown tool: " & name)
   validateJsonValue(server.tools[index].inputSchema, arguments,
     "tool '" & name & "' arguments")
-  let output = await server.tools[index].handler(arguments)
+  let output = await server.tools[index].handler(arguments, context)
+  context.checkCancelled()
   if not output.structuredContent.isNil and
       not server.tools[index].outputSchema.isNil:
     try:
@@ -208,8 +536,64 @@ proc callTool(server: McpServer, params: McpParams): Future[McpResult] {.async.}
     fields["structuredContent"] = output.structuredContent
   newMcpResult(mcpComplete, fields)
 
-proc dispatchAsync*(server: McpServer,
-                    request: McpRpcRequest): Future[McpResult] {.async.} =
+proc readResourceRequest(server: McpServer, params: McpParams,
+                         context: McpContext): Future[McpResult] {.async.} =
+  let uri = requiredString(params.values, "uri", "resources/read params")
+  validateResourceUri(uri, "resources/read")
+  var contents: seq[McpResourceContent]
+  var mimeType = ""
+  let resourceIndex = server.findResource(uri)
+  if resourceIndex >= 0:
+    let resource = server.resources[resourceIndex]
+    contents = await resource.readResource(uri, context)
+    mimeType = resource.mimeType
+  else:
+    var matched = false
+    for resourceTemplate in server.resourceTemplates:
+      let arguments = resourceTemplate.matchResourceTemplate(uri)
+      if arguments.isNil: continue
+      contents = await resourceTemplate.readResourceTemplate(uri, arguments,
+        context)
+      mimeType = resourceTemplate.mimeType
+      matched = true
+      break
+    if not matched:
+      raise newMcpError("Resource not found", mcpInvalidParamsCode,
+        %*{"uri": uri})
+  var fields = resultObject(server).fields
+  fields["contents"] = newJArray()
+  for content in contents:
+    fields["contents"].add resourceContentJson(content, mimeType)
+  fields["ttlMs"] = %server.listTtlMs
+  fields["cacheScope"] = %server.listCacheScope
+  newMcpResult(mcpComplete, fields)
+
+proc getPromptRequest(server: McpServer, params: McpParams,
+                      context: McpContext): Future[McpResult] {.async.} =
+  let name = requiredString(params.values, "name", "prompts/get params")
+  let index = server.findPrompt(name)
+  if index < 0:
+    raise newMcpError("Prompt not found", mcpInvalidParamsCode, %*{"name": name})
+  let values = if "arguments" in params.values:
+    requireObject(params.values["arguments"], "prompts/get arguments")
+  else:
+    newJObject()
+  let prompt = server.prompts[index]
+  let arguments = prompt.decodePromptArguments(values)
+  context.checkCancelled()
+  let messages = await prompt.runPrompt(arguments, context)
+  context.checkCancelled()
+  var fields = resultObject(server).fields
+  if prompt.description.len > 0:
+    fields["description"] = %prompt.description
+  fields["messages"] = newJArray()
+  for message in messages:
+    fields["messages"].add toJson(message)
+  newMcpResult(mcpComplete, fields)
+
+proc dispatchAsync*(server: McpServer, request: McpRpcRequest,
+                    context: McpContext): Future[McpResult] {.async.} =
+  context.checkCancelled()
   case request.methodName
   of "server/discover":
     result = server.discover()
@@ -218,19 +602,29 @@ proc dispatchAsync*(server: McpServer,
   of "tools/list":
     result = server.listTools(request.params)
   of "tools/call":
-    result = await server.callTool(request.params)
+    result = await server.callTool(request.params, context)
+  of "resources/list":
+    result = server.listResources(request.params)
+  of "resources/read":
+    result = await server.readResourceRequest(request.params, context)
+  of "resources/templates/list":
+    result = server.listResourceTemplates(request.params)
+  of "prompts/list":
+    result = server.listPrompts(request.params)
+  of "prompts/get":
+    result = await server.getPromptRequest(request.params, context)
   else:
     raise newMcpError("Method not found: " & request.methodName,
       mcpMethodNotFoundCode)
 
-proc handleMessageAsync*(server: McpServer,
-                         message: McpJsonRpcMessage):
+proc handleMessageAsync*(server: McpServer, message: McpJsonRpcMessage,
+                         context: McpContext):
                          Future[Option[McpJsonRpcMessage]] {.async.} =
   case message.kind
   of mcpRequestMessage, mcpNotificationMessage:
     let request = message.request
     try:
-      let value = await server.dispatchAsync(request)
+      let value = await server.dispatchAsync(request, context)
       if request.kind == mcpNotification:
         return none(McpJsonRpcMessage)
       return some(successResponse(request.id, value))
@@ -239,9 +633,11 @@ proc handleMessageAsync*(server: McpServer,
         return none(McpJsonRpcMessage)
       return some(errorResponse(request.id, error.code, error.msg, error.data))
     except CatchableError as error:
+      context.log(mcpLogError, error.msg)
       if request.kind == mcpNotification:
         return none(McpJsonRpcMessage)
-      return some(errorResponse(request.id, mcpInternalErrorCode, error.msg))
+      return some(errorResponse(request.id, mcpInternalErrorCode,
+        "Internal server error"))
   of mcpResponseMessage, mcpErrorMessage:
     some(errorResponse(McpId(kind: mcpNullId), mcpInvalidRequestCode,
       "server accepts requests and notifications only"))
@@ -253,9 +649,14 @@ proc handleJsonAsync*(server: McpServer,
     return toJson(errorResponse(McpId(kind: mcpNullId),
       mcpInvalidRequestCode, "Invalid Request"))
   let isNotification = "id" notin request
+  var context: McpContext
   try:
     let message = parseMcpMessage(request)
-    let output = await server.handleMessageAsync(message)
+    context = if message.kind in {mcpRequestMessage, mcpNotificationMessage}:
+      newMcpContext(message.request)
+    else:
+      nil
+    let output = await server.handleMessageAsync(message, context)
     if output.isNone:
       return nil
     return toJson(output.get)
@@ -265,10 +666,11 @@ proc handleJsonAsync*(server: McpServer,
     return toJson(errorResponse(requestIdOrNull(request), error.code,
       error.msg, error.data))
   except CatchableError as error:
+    context.log(mcpLogError, error.msg)
     if isNotification:
       return nil
     return toJson(errorResponse(requestIdOrNull(request), mcpInternalErrorCode,
-      error.msg))
+      "Internal server error"))
 
 proc handleJson*(server: McpServer, request: JsonNode): JsonNode =
   waitFor server.handleJsonAsync(request)

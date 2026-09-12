@@ -4,10 +4,13 @@
 ## `nimwire/transports/stdio` when an application does not need the others.
 
 import ./nimwire/core
+import ./nimwire/context
+import ./nimwire/prompts
+import ./nimwire/resources
 import ./nimwire/schema
 import ./nimwire/server
 import ./nimwire/testing
 import ./nimwire/transports/stdio
 import ./nimwire/transports/http
 
-export core, schema, server, testing, stdio, http
+export core, context, prompts, resources, schema, server, testing, stdio, http

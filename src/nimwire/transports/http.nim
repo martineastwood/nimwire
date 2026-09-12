@@ -4,7 +4,7 @@ import std/[asynchttpserver, asyncdispatch, base64, json, nativesockets,
             options, strutils, unicode, uri]
 
 import ../core
-import ../schema
+import ../context
 import ../server
 
 type
@@ -18,6 +18,12 @@ type
     path*: string
     headers*: seq[McpHttpHeader]
     body*: string
+    transport*: McpTransportInfo
+    principal*: McpPrincipal
+    extensionState*: JsonNode
+    stateStore*: McpStateStore
+    logger*: McpLogger
+    progress*: McpProgressReporter
 
   McpHttpResponse* = object
     status*: int
@@ -72,7 +78,8 @@ proc newMcpHttpConfig*(endpoint = "/mcp", host = "127.0.0.1",
 proc newMcpHttpRequest*(httpMethod, path: string, body = "",
                         headers: seq[McpHttpHeader] = @[]): McpHttpRequest =
   McpHttpRequest(httpMethod: httpMethod, path: path, headers: headers,
-    body: body)
+    body: body, transport: McpTransportInfo(kind: mcpTransportHttp,
+      name: "http", endpoint: path))
 
 proc header*(name, value: string): McpHttpHeader =
   McpHttpHeader(name: name, value: value)
@@ -106,7 +113,7 @@ proc jsonError(id: McpId, status, code: int, message: string,
   jsonResponse(status, $toJson(errorResponse(id, code, message, data)))
 
 proc addCors(response: var McpHttpResponse, request: McpHttpRequest,
-             config: McpHttpConfig, originAllowed: bool) =
+             originAllowed: bool) =
   let origin = headerValue(request.headers, "Origin")
   if origin.len > 0 and originAllowed:
     response.headers.addHeader("Access-Control-Allow-Origin", origin)
@@ -285,15 +292,14 @@ proc validateRequestHeaders(server: McpServer, request: McpRpcRequest,
   if request.methodName != "tools/call": return
   if "name" notin request.params.values or
       request.params.values["name"].kind != JString: return
-  let toolIndex = server.findTool(request.params.values["name"].getStr)
-  if toolIndex < 0: return
-  let bindings = mcpHeaderBindings(server.tools[toolIndex].inputSchema)
+  let toolName = request.params.values["name"].getStr
+  if server.findTool(toolName) < 0: return
   let arguments = if "arguments" in request.params.values and
       request.params.values["arguments"].kind == JObject:
     request.params.values["arguments"]
   else:
     newJObject()
-  for binding in bindings:
+  for binding in server.toolHeaderBindings(toolName):
     let headerName = mcpParamHeaderName(binding.name)
     let value = valueAtPath(arguments, binding.path)
     if value.isNil or value.kind == JNull:
@@ -312,43 +318,43 @@ proc addSseMessage(response: McpHttpResponse, value: JsonNode): McpHttpResponse 
   result.body = "event: message\r\ndata: " & $value & "\r\n\r\n"
 
 proc withCors(response: McpHttpResponse, request: McpHttpRequest,
-              config: McpHttpConfig, originAllowed: bool): McpHttpResponse =
+              originAllowed: bool): McpHttpResponse =
   result = response
-  result.addCors(request, config, originAllowed)
+  result.addCors(request, originAllowed)
 
 proc handleHttpRequest*(server: McpServer, request: McpHttpRequest,
                         config = newMcpHttpConfig()): Future[McpHttpResponse] {.async.} =
   let originOkay = allowedOrigin(config, request)
   if not validHeaderEnvelope(request):
-    return withCors(plainResponse(400, "Invalid HTTP headers"), request, config,
+    return withCors(plainResponse(400, "Invalid HTTP headers"), request,
       originOkay)
   if not allowedHost(config, request):
-    return withCors(plainResponse(403, "Forbidden host"), request, config, false)
+    return withCors(plainResponse(403, "Forbidden host"), request, false)
   if not originOkay:
-    return withCors(plainResponse(403, "Forbidden origin"), request, config, false)
+    return withCors(plainResponse(403, "Forbidden origin"), request, false)
   if endpointPath(request.path) != config.endpoint:
-    return withCors(plainResponse(404, "Not Found"), request, config, true)
+    return withCors(plainResponse(404, "Not Found"), request, true)
 
   if request.httpMethod.toUpperAscii == "OPTIONS":
-    return withCors(McpHttpResponse(status: 204), request, config, true)
+    return withCors(McpHttpResponse(status: 204), request, true)
   if request.httpMethod.toUpperAscii != "POST":
     var response = plainResponse(405, "Method Not Allowed")
     response.headers.addHeader("Allow", "POST, OPTIONS")
-    return withCors(response, request, config, true)
+    return withCors(response, request, true)
   if request.body.len > config.maxBodyBytes:
     return withCors(jsonError(McpId(kind: mcpNullId), 413, mcpParseErrorCode,
-      "JSON message exceeds maximum size"), request, config, true)
+      "JSON message exceeds maximum size"), request, true)
   if validateUtf8(request.body) >= 0:
     return withCors(jsonError(McpId(kind: mcpNullId), 400, mcpParseErrorCode,
-      "JSON message must be UTF-8"), request, config, true)
+      "JSON message must be UTF-8"), request, true)
   if not isJsonContentType(request.headers):
     return withCors(plainResponse(415, "Content-Type must be application/json"),
-      request, config, true)
+      request, true)
   if not accepts(request.headers, "application/json") or
       not accepts(request.headers, "text/event-stream"):
     return withCors(plainResponse(406,
       "Accept must include application/json and text/event-stream"), request,
-      config, true)
+      true)
 
   var message: McpJsonRpcMessage
   try:
@@ -357,12 +363,12 @@ proc handleHttpRequest*(server: McpServer, request: McpHttpRequest,
       maxNestingDepth = config.maxNestingDepth)
   except McpError as error:
     return withCors(jsonError(McpId(kind: mcpNullId), 400, error.code,
-      error.msg, error.data), request, config, true)
+      error.msg, error.data), request, true)
 
   if message.kind notin {mcpRequestMessage, mcpNotificationMessage}:
     return withCors(jsonError(McpId(kind: mcpNullId), 400,
       mcpInvalidRequestCode, "Streamable HTTP accepts requests and notifications only"),
-      request, config, true)
+      request, true)
 
   let rpcRequest = message.request
   let requestId = if rpcRequest.kind == mcpRequest:
@@ -373,28 +379,32 @@ proc handleHttpRequest*(server: McpServer, request: McpHttpRequest,
     validateRequestHeaders(server, rpcRequest, request.headers)
   except McpError as error:
     return withCors(jsonError(requestId, 400, error.code, error.msg, error.data),
-      request, config, true)
+      request, true)
 
-  let dispatch = server.handleMessageAsync(message)
+  let context = newMcpContext(rpcRequest, request.transport,
+    principal = request.principal, extensionState = request.extensionState,
+    stateStore = request.stateStore, logger = request.logger,
+    progress = request.progress)
+  let dispatch = server.handleMessageAsync(message, context)
   if config.requestTimeoutMs > 0 and
       not await withTimeout(dispatch, config.requestTimeoutMs):
+    context.cancel()
     return withCors(jsonError(requestId, 408, mcpInternalErrorCode,
-      "MCP request timed out"), request, config, true)
+      "MCP request timed out"), request, true)
   let output = await dispatch
   if output.isNone:
-    return withCors(McpHttpResponse(status: 202), request, config, true)
+    return withCors(McpHttpResponse(status: 202), request, true)
   let value = toJson(output.get)
   let status = if output.get.kind == mcpErrorMessage and
       output.get.errorResponse.error.code == mcpMethodNotFoundCode: 404 else: 200
   var response = jsonResponse(status, $value)
   if config.preferSse:
     response = response.addSseMessage(value)
-  withCors(response, request, config, true)
+  withCors(response, request, true)
 
 proc toMcpHttpRequest*(request: asynchttpserver.Request): McpHttpRequest =
-  result.httpMethod = $request.reqMethod
-  result.path = request.url.path
-  result.body = request.body
+  result = newMcpHttpRequest($request.reqMethod, request.url.path, request.body)
+  result.transport.remoteAddress = request.hostname
   for name, value in request.headers.pairs:
     result.headers.add McpHttpHeader(name: name, value: value)
 

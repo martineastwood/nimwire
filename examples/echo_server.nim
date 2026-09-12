@@ -6,7 +6,7 @@ let server = mcpServer("nimwire-echo", "0.1.0"):
     "type": "object",
     "properties": {"text": {"type": "string"}},
     "required": ["text"]
-  }, proc (args: JsonNode): McpToolResult =
+  }, proc (args: JsonNode, ignoredContext: McpContext): McpToolResult =
     textResult(args["text"].getStr))
 
 server.serveStdio()

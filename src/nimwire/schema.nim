@@ -7,6 +7,14 @@ import ./core
 const schemaTypes = [
   "null", "boolean", "object", "array", "number", "integer", "string"]
 
+const supportedSchemaKeywords = [
+  "$schema", "$id", "type", "properties", "required",
+  "additionalProperties", "items", "prefixItems", "allOf", "anyOf",
+  "oneOf", "not", "enum", "const", "minLength", "maxLength",
+  "minItems", "maxItems", "uniqueItems", "minProperties", "maxProperties",
+  "minimum", "exclusiveMinimum", "maximum", "exclusiveMaximum",
+  "x-mcp-header"]
+
 type
   McpHeaderBinding* = object
     ## A tool argument path mirrored into `Mcp-Param-{name}`.
@@ -61,28 +69,14 @@ proc collectMcpHeaderBindings(node: JsonNode, path: seq[string],
       collectMcpHeaderBindings(property, propertyPath,
         reachable or atRoot, false, bindings)
 
-  for key in ["patternProperties", "additionalProperties", "unevaluatedProperties",
-              "items", "prefixItems", "allOf", "anyOf", "oneOf", "not",
-              "if", "then", "else", "contains", "propertyNames",
-              "dependentSchemas", "$defs", "definitions"]:
-    if key in node:
-      collectMcpHeaderBindings(node[key], path, false, false, bindings)
-  if "patternProperties" in node and node["patternProperties"].kind == JObject:
-    for _, property in node["patternProperties"].pairs:
-      collectMcpHeaderBindings(property, path, false, false, bindings)
-  if "dependentSchemas" in node and node["dependentSchemas"].kind == JObject:
-    for _, property in node["dependentSchemas"].pairs:
-      collectMcpHeaderBindings(property, path, false, false, bindings)
-  for key in ["$defs", "definitions"]:
-    if key in node and node[key].kind == JObject:
-      for _, property in node[key].pairs:
-        collectMcpHeaderBindings(property, path, false, false, bindings)
-  if "prefixItems" in node and node["prefixItems"].kind == JArray:
-    for property in node["prefixItems"].items:
-      collectMcpHeaderBindings(property, path, false, false, bindings)
-  for key in ["allOf", "anyOf", "oneOf"]:
-    if key in node and node[key].kind == JArray:
-      for property in node[key].items:
+  for key in ["additionalProperties", "items", "prefixItems", "allOf",
+              "anyOf", "oneOf", "not"]:
+    if key notin node: continue
+    let nested = node[key]
+    collectMcpHeaderBindings(nested, path, false, false, bindings)
+    if key in ["prefixItems", "allOf", "anyOf", "oneOf"] and
+        nested.kind == JArray:
+      for property in nested.items:
         collectMcpHeaderBindings(property, path, false, false, bindings)
 
 proc mcpHeaderBindings*(schema: JsonNode): seq[McpHeaderBinding] =
@@ -131,12 +125,13 @@ proc validateSchemaArray(node: JsonNode, key, path: string) =
 proc validateSchemaNode(node: JsonNode, path: string) =
   if node.kind == JBool: return
   let schema = schemaObject(node, path)
+  for key in schema.keys:
+    if key notin supportedSchemaKeywords:
+      raise schemaFailure(path, "unsupported schema keyword: " & key)
   if "$schema" in schema and schema["$schema"].kind != JString:
     raise schemaFailure(path, "$schema must be a string")
   if "$id" in schema and schema["$id"].kind != JString:
     raise schemaFailure(path, "$id must be a string")
-  if "$ref" in schema and schema["$ref"].kind != JString:
-    raise schemaFailure(path, "$ref must be a string")
   if "type" in schema:
     let value = schema["type"]
     if value.kind == JString:
@@ -155,20 +150,11 @@ proc validateSchemaNode(node: JsonNode, path: string) =
       raise schemaFailure(path, "properties must be an object")
     for key, value in schema["properties"].pairs:
       validateSchemaNode(value, path & ".properties[" & key & "]")
-  if "patternProperties" in schema:
-    if schema["patternProperties"].kind != JObject:
-      raise schemaFailure(path, "patternProperties must be an object")
-    for key, value in schema["patternProperties"].pairs:
-      if key.len == 0: raise schemaFailure(path, "patternProperties keys must not be empty")
-      validateSchemaNode(value, path & ".patternProperties[" & key & "]")
   if "required" in schema:
     validateUniqueStrings(schema["required"], path & ".required")
   if "additionalProperties" in schema and
       schema["additionalProperties"].kind notin {JBool, JObject}:
     raise schemaFailure(path, "additionalProperties must be a schema or boolean")
-  if "unevaluatedProperties" in schema and
-      schema["unevaluatedProperties"].kind notin {JBool, JObject}:
-    raise schemaFailure(path, "unevaluatedProperties must be a schema or boolean")
   if "items" in schema and schema["items"].kind notin {JBool, JObject}:
     raise schemaFailure(path, "items must be a schema or boolean")
   if "prefixItems" in schema:
@@ -178,19 +164,9 @@ proc validateSchemaNode(node: JsonNode, path: string) =
       validateSchemaNode(value, path & ".prefixItems[" & $index & "]")
   for key in ["allOf", "anyOf", "oneOf"]:
     validateSchemaArray(schema, key, path)
-  for key in ["not", "if", "then", "else", "contains", "propertyNames"]:
+  for key in ["not"]:
     if key in schema:
       validateSchemaNode(schema[key], path & "." & key)
-  if "dependentSchemas" in schema:
-    if schema["dependentSchemas"].kind != JObject:
-      raise schemaFailure(path, "dependentSchemas must be an object")
-    for key, value in schema["dependentSchemas"].pairs:
-      validateSchemaNode(value, path & ".dependentSchemas[" & key & "]")
-  if "dependentRequired" in schema:
-    if schema["dependentRequired"].kind != JObject:
-      raise schemaFailure(path, "dependentRequired must be an object")
-    for key, value in schema["dependentRequired"].pairs:
-      validateUniqueStrings(value, path & ".dependentRequired[" & key & "]")
   if "enum" in schema and
       (schema["enum"].kind != JArray or schema["enum"].len == 0):
     raise schemaFailure(path, "enum must be a non-empty array")
@@ -199,15 +175,8 @@ proc validateSchemaNode(node: JsonNode, path: string) =
   for key in ["minLength", "maxLength", "minItems", "maxItems",
               "minProperties", "maxProperties"]:
     validateStringKeyword(schema, key, path)
-  for key in ["multipleOf", "maximum", "exclusiveMaximum", "minimum",
-              "exclusiveMinimum"]:
+  for key in ["maximum", "exclusiveMaximum", "minimum", "exclusiveMinimum"]:
     validateNumberKeyword(schema, key, path)
-  if "multipleOf" in schema and schema["multipleOf"].getFloat <= 0:
-    raise schemaFailure(path, "multipleOf must be greater than zero")
-  if "pattern" in schema and schema["pattern"].kind != JString:
-    raise schemaFailure(path, "pattern must be a string")
-  if "format" in schema and schema["format"].kind != JString:
-    raise schemaFailure(path, "format must be a string")
   if "uniqueItems" in schema and schema["uniqueItems"].kind != JBool:
     raise schemaFailure(path, "uniqueItems must be a boolean")
 
@@ -367,7 +336,6 @@ proc validateJsonValueNode(schema, value: JsonNode, path: string) =
     return
   if schema.isNil or schema.kind != JObject:
     raise valueFailure(path, "schema must be an object or boolean")
-  if "$ref" in schema: return
   if "type" in schema and not matchesAnyType(value, schema["type"]):
     raise valueFailure(path, "expected " & $schema["type"] & ", got " &
       jsonType(value))

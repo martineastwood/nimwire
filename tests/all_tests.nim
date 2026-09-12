@@ -1,4 +1,4 @@
-import std/[asyncdispatch, json, sequtils, strutils, unittest]
+import std/[asyncdispatch, json, options, os, sequtils, strutils, unittest]
 import ../src/nimwire
 
 suite "nimwire MCP server":
@@ -7,7 +7,7 @@ suite "nimwire MCP server":
       "type": "object",
       "properties": {"text": {"type": "string"}},
       "required": ["text"]
-    }, proc (args: JsonNode): McpToolResult =
+    }, proc (args: JsonNode, ignoredContext: McpContext): McpToolResult =
       textResult(args["text"].getStr))
 
   test "uses the modern stateless discovery request":
@@ -174,7 +174,8 @@ suite "nimwire MCP server":
         maxNestingDepth = 2)
 
   test "validates tool names and schemas at registration":
-    let handler: McpSyncToolHandler = proc (args: JsonNode): McpToolResult =
+    let handler: McpSyncToolHandler = proc (args: JsonNode,
+                                            ignoredContext: McpContext): McpToolResult =
       textResult("ok")
     expect McpError:
       discard newMcpTool("bad name", "invalid", %*{"type": "object"}, handler)
@@ -184,6 +185,10 @@ suite "nimwire MCP server":
     expect McpError:
       discard newMcpTool("valid-name", "invalid", %*{"type": "object"},
         handler, %*{"required": [1]})
+    expect McpError:
+      discard newMcpTool("valid-name", "invalid", %*{
+        "type": "string", "pattern": "^ok$"
+      }, handler)
 
   test "validates arguments before invoking a handler":
     var invoked = false
@@ -193,7 +198,7 @@ suite "nimwire MCP server":
       "properties": {"count": {"type": "integer"}},
       "required": ["count"],
       "additionalProperties": false
-    }, proc (args: JsonNode): McpToolResult =
+      }, proc (args: JsonNode, ignoredContext: McpContext): McpToolResult =
       invoked = true
       textResult("ok"))
     let response = validationServer.handleJson(modernRequest(15, "tools/call",
@@ -205,7 +210,7 @@ suite "nimwire MCP server":
     let outputServer = newMcpServer("output", "1.0.0")
     outputServer.addTool newMcpTool("typed-output", "Typed output", %*{
       "type": "object"
-    }, proc (args: JsonNode): McpToolResult =
+    }, proc (args: JsonNode, ignoredContext: McpContext): McpToolResult =
       structuredResult(%*{"value": "not an integer"}), %*{
         "type": "object",
         "properties": {"value": {"type": "integer"}},
@@ -218,7 +223,7 @@ suite "nimwire MCP server":
     let textServer = newMcpServer("text", "1.0.0")
     textServer.addTool newMcpTool("structured", "Structured output", %*{
       "type": "object"
-    }, proc (args: JsonNode): McpToolResult =
+    }, proc (args: JsonNode, ignoredContext: McpContext): McpToolResult =
       McpToolResult(structuredContent: %*{"value": 1}))
     response = textServer.handleJson(modernRequest(17, "tools/call",
       %*{"name": "structured", "arguments": {}}))
@@ -247,7 +252,7 @@ suite "nimwire MCP server":
     let metadataServer = newMcpServer("metadata", "1.0.0")
     metadataServer.addTool newMcpTool("metadata-tool", "Metadata", %*{
       "type": "object"
-    }, proc (args: JsonNode): McpToolResult = textResult("ok"),
+    }, proc (args: JsonNode, ignoredContext: McpContext): McpToolResult = textResult("ok"),
       title = "Metadata tool",
       icons = %*[{"src": "https://example.com/icon.svg"}],
       annotations = %*{"readOnlyHint": true})
@@ -262,7 +267,8 @@ suite "nimwire MCP server":
     for name in ["charlie", "alpha", "bravo"]:
       pagedServer.addTool newMcpTool(name, "Tool " & name, %*{
         "type": "object"
-      }, proc (args: JsonNode): McpToolResult = textResult(name))
+      }, proc (args: JsonNode, ignoredContext: McpContext): McpToolResult =
+        textResult(name))
     var response = pagedServer.handleJson(modernRequest(19, "tools/list"))
     check response["result"]["tools"].len == 2
     check response["result"]["tools"][0]["name"].getStr == "alpha"
@@ -343,7 +349,8 @@ suite "nimwire Streamable HTTP":
         "region": {"type": "string", "x-mcp-header": "Region"}
       },
       "required": ["region"]
-    }, proc (args: JsonNode): McpToolResult = textResult(args["region"].getStr))
+    }, proc (args: JsonNode, ignoredContext: McpContext): McpToolResult =
+      textResult(args["region"].getStr))
     let body = modernRequest(5, "tools/call", %*{
       "name": "echo-header", "arguments": {"region": "東京"}
     })
@@ -369,7 +376,8 @@ suite "nimwire Streamable HTTP":
             "type": "string", "x-mcp-header": "Nested"
           }}
         }
-      }, proc (args: JsonNode): McpToolResult = textResult("ok"))
+      }, proc (args: JsonNode, ignoredContext: McpContext): McpToolResult =
+        textResult("ok"))
 
   test "enforces origin, host, and body controls":
     let server = newMcpServer("http", "1.0.0")
@@ -389,3 +397,337 @@ suite "nimwire Streamable HTTP":
     headers.add header("Host", "localhost")
     let tooLarge = httpRequest(server, modernRequest(8, "ping"), headers, config)
     check tooLarge.status == 413
+
+  test "cancels a timed-out handler":
+    var cancelled = false
+    let server = newMcpServer("timeout", "1.0.0")
+    server.addTool newMcpTool("slow", "Slow tool", %*{"type": "object"},
+      proc (args: JsonNode, context: McpContext): Future[McpToolResult] {.async.} =
+        await sleepAsync(20)
+        cancelled = context.isCancelled
+        textResult("done"))
+    let request = newMcpHttpRequest("POST", "/mcp",
+      $modernRequest(9, "tools/call", %*{
+        "name": "slow", "arguments": {}
+      }), httpHeaders("tools/call", "slow"))
+    let response = waitFor server.handleHttpRequest(request,
+      newMcpHttpConfig(requestTimeoutMs = 1))
+    check response.status == 408
+    waitFor sleepAsync(30)
+    check cancelled
+
+suite "nimwire request context":
+  test "hides unexpected handler errors and logs them":
+    var loggedMessage = ""
+    let logger: McpLogger = proc (level: McpLogLevel, message: string) =
+      loggedMessage = message
+    let server = newMcpServer("errors", "1.0.0")
+    server.addTool newMcpTool("fails", "Fails", %*{"type": "object"},
+      proc (args: JsonNode, context: McpContext): Future[McpToolResult] {.async.} =
+        raise newException(ValueError, "secret failure"))
+    let message = parseMcpMessage(modernRequest(10, "tools/call", %*{
+      "name": "fails", "arguments": {}
+    }))
+    let response = waitFor server.handleMessageAsync(message,
+      newMcpContext(message.request, logger = logger))
+    check response.get.errorResponse.error.message == "Internal server error"
+    check loggedMessage.contains("secret failure")
+
+  test "passes request metadata and scoped application state to handlers":
+    let server = newMcpServer("context", "1.0.0")
+    let stateStore = newMcpStateStore()
+    let principal = newMcpPrincipal("user-1", %*{"role": "admin"})
+    var logged = false
+    var reported = false
+    let logger: McpLogger = proc (level: McpLogLevel, message: string) =
+      logged = level == mcpLogInfo and message == "called"
+    let progress: McpProgressReporter = proc (value, total: float,
+                                               message: string): Future[void] {.async.} =
+      reported = value == 0.5 and total == 1.0 and message == "halfway"
+    server.addTool newMcpTool("context-tool", "Reads context", %*{
+      "type": "object"
+    }, proc (args: JsonNode, context: McpContext): Future[McpToolResult] {.async.} =
+      check context.methodName == "tools/call"
+      check context.requestId.integerValue == 1
+      check context.metadata.protocolVersion == mcpProtocolVersion
+      check context.transport.kind == mcpTransportHttp
+      check context.principal.subject == "user-1"
+      check context.extensionState["requestTag"].getStr == "test"
+      context.log(mcpLogInfo, "called")
+      await context.reportProgress(0.5, 1.0, "halfway")
+      let handle = context.mintStateHandle(%*{"step": 1})
+      let claim = context.verifyStateHandle(handle)
+      check claim.isSome
+      check claim.get.value["step"].getInt == 1
+      textResult("ok"))
+
+    let body = modernRequest(1, "tools/call", %*{
+      "name": "context-tool", "arguments": {}
+    })
+    var request = newMcpHttpRequest("POST", "/mcp", $body, @[
+      header("Content-Type", "application/json"),
+      header("Accept", "application/json, text/event-stream"),
+      header("MCP-Protocol-Version", mcpProtocolVersion),
+      header("Mcp-Method", "tools/call"),
+      header("Mcp-Name", "context-tool")])
+    request.principal = principal
+    request.extensionState = %*{"requestTag": "test"}
+    request.stateStore = stateStore
+    request.logger = logger
+    request.progress = progress
+    let response = waitFor server.handleHttpRequest(request)
+    check response.status == 200
+    check logged
+    check reported
+
+  test "exposes cancellation and binds state handles to their subject":
+    let server = newMcpServer("context", "1.0.0")
+    let message = parseMcpMessage(modernRequest(2, "ping"))
+    let cancellation = newMcpCancellation()
+    cancellation.cancel()
+    let context = newMcpContext(message.request, cancellation = cancellation)
+    let response = waitFor server.handleMessageAsync(message, context)
+    check response.isSome
+    check response.get.errorResponse.error.code == mcpRequestCancelledCode
+
+    let store = newMcpStateStore()
+    let handle = store.mintStateHandle("user-1", %*{"ok": true})
+    check handle.startsWith("nimwire.")
+    check store.verifyStateHandle(handle, "wrong-user").isNone
+    check store.verifyStateHandle(handle, "user-1").get.value["ok"].getBool
+    check store.revokeStateHandle(handle)
+    check store.verifyStateHandle(handle, "user-1").isNone
+
+suite "nimwire resources":
+  test "registers, lists, and reads text and binary resources":
+    let server = newMcpServer("resources", "1.0.0", listPageSize = 1)
+    server.addResource newMcpResource("file:///README.md", "README",
+      resourceText("file:///README.md", "hello", "text/markdown"),
+      title = "Project README", description = "Project documentation",
+      annotations = %*{"audience": ["user"]})
+    server.addResource newMcpResource("file:///image.png", "image",
+      resourceBlob("file:///image.png", "AQI=", "image/png"))
+
+    var response = server.handleJson(modernRequest(30, "server/discover"))
+    check response["result"]["capabilities"]["resources"].kind == JObject
+    response = server.handleJson(modernRequest(31, "resources/list"))
+    check response["result"]["resources"].len == 1
+    check response["result"]["resources"][0]["uri"].getStr ==
+      "file:///README.md"
+    check response["result"]["resources"][0]["title"].getStr ==
+      "Project README"
+    let cursor = response["result"]["nextCursor"].getStr
+    response = server.handleJson(modernRequest(32, "resources/list", %*{
+      "cursor": cursor
+    }))
+    check response["result"]["resources"][0]["uri"].getStr ==
+      "file:///image.png"
+
+    response = server.handleJson(modernRequest(33, "resources/read", %*{
+      "uri": "file:///README.md"
+    }))
+    check response["result"]["contents"][0]["text"].getStr == "hello"
+    check response["result"]["contents"][0]["mimeType"].getStr ==
+      "text/markdown"
+    response = server.handleJson(modernRequest(34, "resources/read", %*{
+      "uri": "file:///image.png"
+    }))
+    check response["result"]["contents"][0]["blob"].getStr == "AQI="
+    check "text" notin response["result"]["contents"][0]
+
+  test "reads URI templates and exposes completion hooks":
+    let server = newMcpServer("templates", "1.0.0")
+    var resourceTemplate = newMcpResourceTemplate("demo:///{owner}/{name}",
+      "Demo records", proc (uri: string, arguments: JsonNode,
+                             ignoredContext: McpContext): seq[McpResourceContent] =
+      @[resourceText(uri, arguments["owner"].getStr & ":" &
+        arguments["name"].getStr, "text/plain")])
+    resourceTemplate.addCompletion("owner",
+      proc (argument, prefix: string,
+            ignoredContext: McpContext): seq[string] = @[prefix & "-team"])
+    server.addResourceTemplate(resourceTemplate)
+
+    var response = server.handleJson(modernRequest(35,
+      "resources/templates/list"))
+    check response["result"]["resourceTemplates"][0]["uriTemplate"].getStr ==
+      "demo:///{owner}/{name}"
+    response = server.handleJson(modernRequest(36, "resources/read", %*{
+      "uri": "demo:///acme/report"
+    }))
+    check response["result"]["contents"][0]["text"].getStr == "acme:report"
+    let message = parseMcpMessage(modernRequest(37, "resources/read", %*{
+      "uri": "demo:///acme/report"
+    }))
+    let completions = waitFor server.completeResourceTemplate(
+      "demo:///{owner}/{name}", "owner", "ac",
+      newMcpContext(message.request))
+    check completions == @["ac-team"]
+
+    response = server.handleJson(modernRequest(38, "resources/read", %*{
+      "uri": "demo:///acme"
+    }))
+    check response["error"]["code"].getInt == mcpInvalidParamsCode
+
+  test "emits subscribed resource change notifications":
+    let server = newMcpServer("notifications", "1.0.0")
+    server.addResource newMcpResource("memo://one", "one",
+      resourceText("memo://one", "one"))
+    var notifications: seq[JsonNode]
+    let notificationHandler: McpResourceNotificationHandler =
+      proc (message: JsonNode) = notifications.add message
+    let subscription = server.subscribeResources(
+      McpId(kind: mcpIntegerId, integerValue: 39), notificationHandler,
+      resourcesListChanged = true, resourceUris = @["memo://one"])
+    server.markResourcesChanged()
+    server.markResourceUpdated("memo://one")
+    check notifications.len == 2
+    check notifications[0]["method"].getStr ==
+      "notifications/resources/list_changed"
+    check notifications[1]["method"].getStr ==
+      "notifications/resources/updated"
+    check notifications[1]["params"]["uri"].getStr == "memo://one"
+    check notifications[1]["params"]["_meta"][
+      "io.modelcontextprotocol/subscriptionId"].getInt == 39
+    check server.unsubscribeResources(subscription)
+
+  test "confines file resources to their root":
+    let root = getTempDir() / ("nimwire-resource-" & $getCurrentProcessId())
+    let outside = root & "-outside.txt"
+    createDir(root)
+    writeFile(root / "inside.txt", "inside")
+    writeFile(outside, "outside")
+    defer:
+      removeFile(root / "inside.txt")
+      removeDir(root)
+      removeFile(outside)
+    check safeResourcePath(root, "inside.txt") ==
+      expandFilename(root) / "inside.txt"
+    expect McpError:
+      discard safeResourcePath(root, "../" & outside.lastPathPart)
+    let resource = newFileResource(root, "inside.txt",
+      uriValue = "file:///inside.txt")
+    let server = newMcpServer("files", "1.0.0")
+    server.addResource(resource)
+    let response = server.handleJson(modernRequest(40, "resources/read", %*{
+      "uri": "file:///inside.txt"
+    }))
+    check response["result"]["contents"][0]["text"].getStr == "inside"
+
+suite "nimwire prompts":
+  test "registers, lists, and gets prompts with typed arguments":
+    let server = newMcpServer("prompts", "1.0.0", listPageSize = 1)
+    let reviewHandler: McpSyncPromptHandler = proc (
+        arguments: McpPromptArguments,
+        ignoredContext: McpContext): seq[McpPromptMessage] =
+      @[
+        userText("Review " & getPromptArgument(arguments, "code")),
+        assistantPrompt(imageContent("AQI=", "image/png"))]
+    server.addPrompt newMcpPrompt("review", reviewHandler,
+      description = "Review code",
+      arguments = @[newMcpPromptArgument("code", "Code", required = true)],
+      icons = %*[{"src": "https://example.com/prompt.svg"}])
+    let plainHandler: McpSyncPromptSingleHandler = proc (
+        arguments: McpPromptArguments,
+        ignoredContext: McpContext): McpPromptMessage =
+      assistantText("done")
+    server.addPrompt newMcpPrompt("plain", plainHandler, title = "Plain")
+    let completionHandler: McpSyncPromptCompletionHandler = proc (
+        argument, prefix: string,
+        ignoredContext: McpContext): seq[string] = @[prefix & "-review"]
+    server.addPromptCompletion("review", "code", completionHandler)
+    let completionContext = newMcpContext(
+      parseMcpMessage(modernRequest(53, "prompts/get")).request)
+    let completions = waitFor server.completePromptArgument("review", "code", "le",
+      completionContext)
+    check completions == @["le-review"]
+
+    var response = server.handleJson(modernRequest(50, "server/discover"))
+    check response["result"]["capabilities"]["prompts"][
+      "listChanged"].getBool == false
+    response = server.handleJson(modernRequest(51, "prompts/list"))
+    check response["result"]["prompts"].len == 1
+    check response["result"]["prompts"][0]["name"].getStr == "plain"
+    let cursor = response["result"]["nextCursor"].getStr
+    response = server.handleJson(modernRequest(52, "prompts/list", %*{
+      "cursor": cursor
+    }))
+    check response["result"]["prompts"][0]["name"].getStr == "review"
+    check response["result"]["prompts"][0]["description"].getStr ==
+      "Review code"
+    check response["result"]["prompts"][0]["arguments"][0]["required"].getBool
+    check response["result"]["prompts"][0]["icons"][0]["src"].getStr ==
+      "https://example.com/prompt.svg"
+
+    response = server.handleJson(modernRequest(53, "prompts/get", %*{
+      "name": "review", "arguments": {"code": "let x = 1"}
+    }))
+    check response["result"]["description"].getStr == "Review code"
+    check response["result"]["messages"][0]["role"].getStr == "user"
+    check response["result"]["messages"][0]["content"]["text"].getStr ==
+      "Review let x = 1"
+    check response["result"]["messages"][1]["role"].getStr == "assistant"
+    check response["result"]["messages"][1]["content"]["type"].getStr ==
+      "image"
+
+  test "supports every prompt content kind":
+    let server = newMcpServer("prompt-content", "1.0.0")
+    let handler: McpSyncPromptHandler = proc (
+        arguments: McpPromptArguments,
+        ignoredContext: McpContext): seq[McpPromptMessage] =
+      @[
+        userText("hello"),
+        userPrompt(audioContent("AQI=", "audio/wav")),
+        userPrompt(resourceLinkContent("memo://today", "Today's memo")),
+        assistantPrompt(embeddedResourceContent(%*{
+          "uri": "memo://today", "text": "Ship it"
+        }))]
+    server.addPrompt newMcpPrompt("all-content", handler)
+    let response = server.handleJson(modernRequest(54, "prompts/get", %*{
+      "name": "all-content"
+    }))
+    check response["result"]["messages"].len == 4
+    check response["result"]["messages"][1]["content"]["type"].getStr ==
+      "audio"
+    check response["result"]["messages"][2]["content"]["type"].getStr ==
+      "resource_link"
+    check response["result"]["messages"][3]["content"]["type"].getStr ==
+      "resource"
+
+  test "rejects invalid prompt arguments and content":
+    let server = newMcpServer("prompt-validation", "1.0.0")
+    let handler: McpSyncPromptHandler = proc (
+        arguments: McpPromptArguments,
+        ignoredContext: McpContext): seq[McpPromptMessage] = @[userText("ok")]
+    server.addPrompt newMcpPrompt("required", handler,
+      arguments = @[newMcpPromptArgument("value", required = true)])
+    var response = server.handleJson(modernRequest(55, "prompts/get", %*{
+      "name": "required"
+    }))
+    check response["error"]["code"].getInt == mcpInvalidParamsCode
+    response = server.handleJson(modernRequest(56, "prompts/get", %*{
+      "name": "required", "arguments": {"unknown": "x"}
+    }))
+    check response["error"]["code"].getInt == mcpInvalidParamsCode
+    response = server.handleJson(modernRequest(57, "prompts/get", %*{
+      "name": "required", "arguments": {"value": 1}
+    }))
+    check response["error"]["code"].getInt == mcpInvalidParamsCode
+    response = server.handleJson(modernRequest(58, "prompts/get", %*{
+      "name": "missing"
+    }))
+    check response["error"]["code"].getInt == mcpInvalidParamsCode
+    expect McpError:
+      discard newMcpPromptMessage(mcpPromptUser, %*{"type": "video"})
+
+  test "marks prompt listings as changed":
+    let server = newMcpServer("prompt-changes", "1.0.0")
+    let handler: McpSyncPromptSingleHandler = proc (
+        arguments: McpPromptArguments,
+        ignoredContext: McpContext): McpPromptMessage = userText("ok")
+    server.addPrompt newMcpPrompt("one", handler)
+    expect McpError:
+      server.addPrompt newMcpPrompt("one", handler)
+    server.markPromptsChanged()
+    let response = server.handleJson(modernRequest(59, "server/discover"))
+    check response["result"]["capabilities"]["prompts"][
+      "listChanged"].getBool

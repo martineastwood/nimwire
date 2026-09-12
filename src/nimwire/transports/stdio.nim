@@ -3,6 +3,7 @@
 import std/[asyncdispatch, json, options, strutils]
 
 import ../core
+import ../context
 import ../server
 
 proc writeResponse(message: McpJsonRpcMessage) =
@@ -18,7 +19,12 @@ proc serveStdio*(server: McpServer,
     if line.strip.len == 0: continue
     try:
       let message = parseMcpMessage(line, maxMessageBytes, maxNestingDepth)
-      let output = waitFor server.handleMessageAsync(message)
+      let output = if message.kind in {mcpRequestMessage, mcpNotificationMessage}:
+        let context = newMcpContext(message.request,
+          McpTransportInfo(kind: mcpTransportStdio, name: "stdio"))
+        waitFor server.handleMessageAsync(message, context)
+      else:
+        waitFor server.handleMessageAsync(message, nil)
       if output.isSome:
         writeResponse(output.get)
     except McpError as error:
