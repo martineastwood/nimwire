@@ -1,4 +1,4 @@
-import std/[asyncdispatch, json, options, os, sequtils, strutils, unittest]
+import std/[asyncdispatch, json, options, os, sequtils, strutils, times, unittest]
 import ../src/nimwire
 
 suite "nimwire MCP server":
@@ -416,6 +416,29 @@ suite "nimwire Streamable HTTP":
     waitFor sleepAsync(30)
     check cancelled
 
+  test "streams progress and the final response when requested":
+    let server = newMcpServer("http-progress", "1.0.0")
+    server.addTool newMcpTool("progress", "Progress", %*{"type": "object"},
+      proc (args: JsonNode, context: McpContext): Future[McpToolResult] {.async.} =
+        await context.reportProgress(0.5, 1.0, "halfway")
+        textResult("done"))
+    var body = modernRequest(10, "tools/call", %*{
+      "name": "progress", "arguments": {}
+    })
+    body["params"]["_meta"]["progressToken"] = %"progress-10"
+    var request = newMcpHttpRequest("POST", "/mcp", $body,
+      httpHeaders("tools/call", "progress"))
+    var streamed: seq[JsonNode]
+    request.streamResponses = true
+    request.streamWriter = proc (message: JsonNode): Future[void] {.async.} =
+      streamed.add message
+    request.notificationSender = request.streamWriter
+    let response = waitFor server.handleHttpRequest(request)
+    check response.streamed
+    check streamed.len == 2
+    check streamed[0]["method"].getStr == "notifications/progress"
+    check streamed[1]["result"]["content"][0]["text"].getStr == "done"
+
   test "streams subscription messages through a framework writer":
     let server = newMcpServer("http-subscriptions", "1.0.0")
     let toolHandler: McpSyncToolHandler = proc (
@@ -463,7 +486,7 @@ suite "nimwire request context":
     let response = waitFor server.handleMessageAsync(message,
       newMcpContext(message.request, logger = logger))
     check response.get.errorResponse.error.message == "Internal server error"
-    check loggedMessage.contains("secret failure")
+    check loggedMessage == "request failed: tools/call"
 
   test "passes request metadata and scoped application state to handlers":
     let server = newMcpServer("context", "1.0.0")
@@ -1132,3 +1155,223 @@ suite "nimwire multi round-trip requests":
       retryContext)
     check retryOutput.get.response.result.resultType == mcpComplete
     check verified
+
+suite "nimwire cancellation, progress, and timeouts":
+  test "emits progress notifications from a request token":
+    var request = modernRequest(140, "ping")
+    request["params"]["_meta"]["progressToken"] = %"progress-1"
+    let message = parseMcpMessage(request)
+    var notifications: seq[JsonNode]
+    let sender: McpNotificationSender = proc (notification: JsonNode): Future[void] {.async.} =
+      notifications.add notification
+    let context = newMcpContext(message.request, notificationSender = sender)
+    waitFor context.reportProgress(1.0, 2.0, "started")
+    waitFor context.reportProgress(2.0, 2.0, "finished")
+    check notifications.len == 2
+    check notifications[0]["method"].getStr == "notifications/progress"
+    check notifications[0]["params"]["progressToken"].getStr == "progress-1"
+    check notifications[1]["params"]["progress"].getFloat == 2.0
+    expect McpError:
+      waitFor context.reportProgress(2.0, 2.0)
+
+  test "cancels active requests and exposes the cancellation reason":
+    let server = newMcpServer("cancel", "1.0.0")
+    var observedReason = ""
+    server.addTool newMcpTool("slow", "Slow", %*{"type": "object"},
+      proc (args: JsonNode, context: McpContext): Future[McpToolResult] {.async.} =
+        await sleepAsync(20)
+        observedReason = context.cancellation.reason
+        context.checkCancelled()
+        textResult("done"))
+    let message = parseMcpMessage(modernRequest(141, "tools/call", %*{
+      "name": "slow", "arguments": {}
+    }))
+    let context = newMcpContext(message.request)
+    let pending = server.handleMessageAsync(message, context)
+    waitFor sleepAsync(1)
+    check server.cancelRequest(message.request.id, "client left")
+    check context.cancellation.waitCancelled().finished
+    let output = waitFor pending
+    check output.get.errorResponse.error.code == mcpRequestCancelledCode
+    check observedReason == "client left"
+    check not server.cancelRequest(message.request.id)
+
+  test "enforces per-tool deadlines and cancels on shutdown":
+    let server = newMcpServer("tool-timeout", "1.0.0")
+    var timedOut = false
+    server.addTool newMcpTool("slow", "Slow", %*{"type": "object"},
+      proc (args: JsonNode, context: McpContext): Future[McpToolResult] {.async.} =
+        await sleepAsync(20)
+        timedOut = context.isCancelled
+        context.checkCancelled()
+        textResult("done"))
+    server.setToolTimeout("slow", 1)
+    let response = server.handleJson(modernRequest(142, "tools/call", %*{
+      "name": "slow", "arguments": {}
+    }))
+    check response["error"]["code"].getInt == mcpInternalErrorCode
+    waitFor sleepAsync(25)
+    check timedOut
+
+    var shutdownSeen = false
+    server.addTool newMcpTool("shutdown-wait", "Wait", %*{"type": "object"},
+      proc (args: JsonNode, context: McpContext): Future[McpToolResult] {.async.} =
+        await sleepAsync(20)
+        shutdownSeen = context.isCancelled
+        context.checkCancelled()
+        textResult("done"))
+    let message = parseMcpMessage(modernRequest(143, "tools/call", %*{
+      "name": "shutdown-wait", "arguments": {}
+    }))
+    let pending = server.handleMessageAsync(message, newMcpContext(message.request))
+    waitFor sleepAsync(1)
+    check server.cancelActiveRequests("shutdown") == 1
+    discard waitFor pending
+    check shutdownSeen
+
+suite "nimwire authorization":
+  proc authHeaders(methodName: string; toolName = ""): seq[McpHttpHeader] =
+    result = @[
+      header("Content-Type", "application/json"),
+      header("Accept", "application/json, text/event-stream"),
+      header("MCP-Protocol-Version", mcpProtocolVersion),
+      header("Mcp-Method", methodName)]
+    if toolName.len > 0: result.add header("Mcp-Name", toolName)
+
+  test "protects HTTP requests and publishes resource metadata":
+    let verifier: McpBearerTokenVerifier = proc (token, resource: string): McpAuthClaims =
+      if token notin ["good", "limited"]:
+        raise newException(ValueError, "bad token")
+      let scopes = if token == "good": @[("read")] else: newSeq[string]()
+      newMcpAuthClaims("alice", "https://auth.example", @[resource], scopes,
+        epochTime().int64 + 60)
+    let authorization = newMcpAuthorizationConfig(
+      resource = "https://mcp.example/mcp",
+      authorizationServers = @["https://auth.example"],
+      scopesSupported = @["read", "write"], requiredScopes = @["read"],
+      resourceMetadataUrl = "https://mcp.example/.well-known/oauth-protected-resource/mcp",
+      verifier = verifier)
+    let config = newMcpHttpConfig(authorization = authorization)
+    let server = newMcpServer("auth", "1.0.0")
+    server.addTool newMcpTool("whoami", "Caller", %*{"type": "object"},
+      proc (args: JsonNode, context: McpContext): McpToolResult =
+        textResult(context.principal.subject & ":" & context.principal.scopes[0]))
+    let body = modernRequest(150, "tools/call", %*{
+      "name": "whoami", "arguments": {}
+    })
+    var request = newMcpHttpRequest("POST", "/mcp", $body,
+      authHeaders("tools/call", "whoami"))
+    var response = waitFor server.handleHttpRequest(request, config)
+    check response.status == 401
+    check response.headers.anyIt(it.name == "WWW-Authenticate" and
+      it.value.startsWith("Bearer"))
+
+    request.headers.add header("Authorization", "Bearer limited")
+    response = waitFor server.handleHttpRequest(request, config)
+    check response.status == 403
+    check response.headers.anyIt(it.name == "WWW-Authenticate" and
+      it.value.contains("insufficient_scope"))
+
+    request.headers[^1].value = "Bearer bad"
+    response = waitFor server.handleHttpRequest(request, config)
+    check response.status == 401
+
+    request.headers[^1].value = "Bearer good"
+    response = waitFor server.handleHttpRequest(request, config)
+    check response.status == 200
+    check response.body.parseJson["result"]["content"][0]["text"].getStr ==
+      "alice:read"
+
+    let metadata = waitFor server.handleHttpRequest(
+      newMcpHttpRequest("GET", "/.well-known/oauth-protected-resource/mcp"), config)
+    check metadata.status == 200
+    check metadata.body.parseJson["resource"].getStr ==
+      "https://mcp.example/mcp"
+    check metadata.body.parseJson["authorization_servers"][0].getStr ==
+      "https://auth.example"
+
+  test "filters features by principal and validates client metadata":
+    let server = newMcpServer("filters", "1.0.0")
+    server.addTool newMcpTool("private", "Private", %*{"type": "object"},
+      proc (args: JsonNode, ignoredContext: McpContext): McpToolResult = textResult("ok"))
+    server.addTool newMcpTool("public", "Public", %*{"type": "object"},
+      proc (args: JsonNode, ignoredContext: McpContext): McpToolResult = textResult("ok"))
+    server.setToolFilter(proc (name: string, principal: McpPrincipal): bool =
+      not principal.isNil and principal.subject == "alice" or name == "public")
+    let message = parseMcpMessage(modernRequest(151, "tools/list"))
+    var response = waitFor server.handleMessageAsync(message,
+      newMcpContext(message.request, principal = newMcpPrincipal("bob")))
+    check response.get.response.result.fields["tools"].len == 1
+    check response.get.response.result.fields["tools"][0]["name"].getStr == "public"
+
+    server.addResource newMcpResource("memo://private", "Private",
+      resourceText("memo://private", "secret"))
+    server.addResource newMcpResource("memo://public", "Public",
+      resourceText("memo://public", "hello"))
+    server.setResourceFilter(proc (uri: string, principal: McpPrincipal): bool =
+      uri == "memo://public")
+    let resourceList = parseMcpMessage(modernRequest(152, "resources/list"))
+    response = waitFor server.handleMessageAsync(resourceList,
+      newMcpContext(resourceList.request, principal = newMcpPrincipal("bob")))
+    check response.get.response.result.fields["resources"].len == 1
+    check response.get.response.result.fields["resources"][0]["uri"].getStr ==
+      "memo://public"
+
+    let promptHandler: McpSyncPromptSingleHandler = proc (
+        arguments: McpPromptArguments,
+        ignoredContext: McpContext): McpPromptMessage = userText("hello")
+    server.addPrompt newMcpPrompt("private-prompt", promptHandler)
+    server.addPrompt newMcpPrompt("public-prompt", promptHandler)
+    server.setPromptFilter(proc (name: string, principal: McpPrincipal): bool =
+      name == "public-prompt")
+    let promptList = parseMcpMessage(modernRequest(153, "prompts/list"))
+    response = waitFor server.handleMessageAsync(promptList,
+      newMcpContext(promptList.request, principal = newMcpPrincipal("bob")))
+    check response.get.response.result.fields["prompts"].len == 1
+    check response.get.response.result.fields["prompts"][0]["name"].getStr ==
+      "public-prompt"
+
+    let metadata = parseClientIdMetadata(%*{
+      "client_id": "https://client.example",
+      "client_name": "Example",
+      "redirect_uris": ["https://client.example/callback"],
+      "com.example/extension": true
+    })
+    check metadata.clientName == "Example"
+    check metadata.redirectUris.len == 1
+    check metadata.extraFields["com.example/extension"].getBool
+    expect McpError:
+      discard parseClientIdMetadata(%*{"client_id": "not-a-url"})
+    expect McpError:
+      rejectTokenPassthrough("Bearer secret")
+
+  test "provides bounded output, redaction, and safe URL helpers":
+    let redacted = redactJson(%*{
+      "authorization": "Bearer secret",
+      "nested": {"token": "secret", "visible": true}
+    })
+    check redacted["authorization"].getStr == "[REDACTED]"
+    check redacted["nested"]["token"].getStr == "[REDACTED]"
+    check redacted["nested"]["visible"].getBool
+    check redactHeaderValue("Cookie", "session=secret") == "[REDACTED]"
+    check redactBearerToken("Bearer secret") == "Bearer [REDACTED]"
+    check isSafeMcpUrl("https://example.com/consent")
+    check not isSafeMcpUrl("http://example.com/consent")
+    check not isSafeMcpUrl("https://user:pass@example.com/consent")
+    expect McpError:
+      discard newMcpElicitationUrlRequest("Consent", "http://example.com")
+
+    let limited = newMcpServer("limits", "1.0.0")
+    limited.setSecurityLimits(newMcpSecurityLimits(maxToolCount = 1,
+      maxContentBytes = 12))
+    limited.addTool newMcpTool("one", "One", %*{"type": "object"},
+      proc (args: JsonNode, ignoredContext: McpContext): McpToolResult =
+        textResult("this output is too long"))
+    expect McpError:
+      limited.addTool newMcpTool("two", "Two", %*{"type": "object"},
+        proc (args: JsonNode, ignoredContext: McpContext): McpToolResult =
+          textResult("ok"))
+    let response = limited.handleJson(modernRequest(160, "tools/call", %*{
+      "name": "one", "arguments": {}
+    }))
+    check response["error"]["code"].getInt == mcpInvalidParamsCode

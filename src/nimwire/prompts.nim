@@ -19,6 +19,7 @@ type
 
   McpPromptMessage* = object
     role*: McpPromptRole
+    ## Untrusted caller-facing metadata; never use it as an authorization policy.
     content*: JsonNode
 
   McpPromptHandler* = proc (arguments: McpPromptArguments,

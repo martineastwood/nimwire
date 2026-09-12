@@ -1,9 +1,10 @@
 ## Multi round-trip requests and low-level input handling.
 
-import std/[json, sequtils, tables, uri]
+import std/[json, tables]
 
 import ./core
 import ./schema
+import ./security
 
 type
   McpElicitationMode* = enum
@@ -54,13 +55,6 @@ proc parseInputAction(value: string): McpElicitationAction =
   of "cancel": mcpElicitationCancel
   else: raise newMcpError("elicitation action must be accept, decline, or cancel")
 
-proc validUrl(value: string): bool =
-  if value.len == 0 or value.anyIt(it in {' ', '\t', '\r', '\n'}): return false
-  try:
-    parseUri(value).scheme.len > 0
-  except CatchableError:
-    false
-
 proc newMcpInputRequest*(methodName: string,
                          params: JsonNode = nil): McpInputRequest =
   if not inputMethodName(methodName):
@@ -87,8 +81,7 @@ proc newMcpElicitationFormRequest*(message: string,
 proc newMcpElicitationUrlRequest*(message, url: string): McpInputRequest =
   if message.len == 0:
     raise newMcpError("elicitation message must not be empty")
-  if not validUrl(url):
-    raise newMcpError("elicitation url must be a valid URL")
+  discard requireSafeMcpUrl(url)
   newMcpInputRequest("elicitation/create", %*{
     "mode": "url", "message": message, "url": url
   })
@@ -173,8 +166,7 @@ proc parseMcpElicitationRequest*(request: McpInputRequest):
       requestedSchema: params["requestedSchema"])
   of "url":
     let url = requiredString(params, "url", "elicitation/create")
-    if not validUrl(url):
-      raise newMcpError("elicitation url must be a valid URL")
+    discard requireSafeMcpUrl(url)
     McpElicitationRequest(mode: mcpElicitationUrl, message: message, url: url)
   else:
     raise newMcpError("elicitation mode must be form or url")

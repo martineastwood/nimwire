@@ -18,14 +18,19 @@ type
 
   McpPrincipal* = ref object
     subject*: string
+    issuer*: string
+    scopes*: seq[string]
     claims*: JsonNode
 
   McpCancellation* = ref object
     cancelled: bool
+    reason*: string
+    signal: Future[void]
 
   McpLogger* = proc (level: McpLogLevel, message: string) {.closure.}
   McpProgressReporter* = proc (progress, total: float,
                                message: string): Future[void] {.closure.}
+  McpNotificationSender* = proc (message: JsonNode): Future[void] {.closure.}
   McpRequestStateSealer* = proc (payload: JsonNode,
                                  context: McpContext): string {.closure.}
   McpRequestStateVerifier* = proc (state: string,
@@ -60,20 +65,37 @@ type
     requestStateSealer*: McpRequestStateSealer
     requestStateVerifier*: McpRequestStateVerifier
     stateStore*: McpStateStore
+    notificationSender*: McpNotificationSender
+    hasProgressToken*: bool
+    progressToken*: McpId
+    deadlineAt*: float
+    lastProgress*: float
+    hasReportedProgress*: bool
     hasInputRequired*: bool
     inputRequired*: McpResult
 
-proc newMcpPrincipal*(subject: string, claims: JsonNode = nil): McpPrincipal =
+proc newMcpPrincipal*(subject: string, claims: JsonNode = nil,
+                      issuer = "", scopes: seq[string] = @[]): McpPrincipal =
   if subject.len == 0:
     raise newMcpError("principal subject must not be empty")
   McpPrincipal(subject: subject,
+    issuer: issuer, scopes: scopes,
     claims: if claims.isNil: newJObject() else: claims)
 
 proc newMcpCancellation*(): McpCancellation =
-  McpCancellation(cancelled: false)
+  McpCancellation(cancelled: false,
+    signal: newFuture[void]("mcpCancellation"))
 
-proc cancel*(cancellation: McpCancellation) =
-  if not cancellation.isNil: cancellation.cancelled = true
+proc cancel*(cancellation: McpCancellation, reason = "") =
+  if cancellation.isNil or cancellation.cancelled: return
+  cancellation.cancelled = true
+  cancellation.reason = reason
+  if not cancellation.signal.finished: cancellation.signal.complete()
+
+proc waitCancelled*(cancellation: McpCancellation): Future[void] =
+  if cancellation.isNil:
+    raise newMcpError("MCP cancellation must not be nil")
+  cancellation.signal
 
 proc isCancelled*(cancellation: McpCancellation): bool =
   not cancellation.isNil and cancellation.cancelled
@@ -139,7 +161,10 @@ proc newMcpContext*(request: McpRpcRequest,
                     logger: McpLogger = nil,
                     progress: McpProgressReporter = nil,
                     requestStateSealer: McpRequestStateSealer = nil,
-                    requestStateVerifier: McpRequestStateVerifier = nil): McpContext =
+                    requestStateVerifier: McpRequestStateVerifier = nil,
+                    notificationSender: McpNotificationSender = nil,
+                    deadlineMs = 0): McpContext =
+  let hasProgressToken = request.params.meta.hasProgressToken
   McpContext(
     requestId: if request.kind == mcpRequest: request.id else:
       McpId(kind: mcpNullId),
@@ -159,10 +184,15 @@ proc newMcpContext*(request: McpRpcRequest,
       request.params.values["requestState"].getStr else: "",
     requestStateSealer: requestStateSealer,
     requestStateVerifier: requestStateVerifier,
-    stateStore: stateStore)
+    stateStore: stateStore,
+    notificationSender: notificationSender,
+    hasProgressToken: hasProgressToken,
+    progressToken: if hasProgressToken: request.params.meta.progressToken else:
+      McpId(kind: mcpNullId),
+    deadlineAt: if deadlineMs > 0: epochTime() + deadlineMs.float / 1000.0 else: 0.0)
 
-proc cancel*(context: McpContext) =
-  if not context.isNil: context.cancellation.cancel()
+proc cancel*(context: McpContext, reason = "") =
+  if not context.isNil: context.cancellation.cancel(reason)
 
 proc isCancelled*(context: McpContext): bool =
   not context.isNil and context.cancellation.isCancelled
@@ -170,7 +200,14 @@ proc isCancelled*(context: McpContext): bool =
 proc checkCancelled*(context: McpContext) =
   if context.isNil:
     raise newMcpError("MCP context must not be nil")
+  if context.deadlineAt > 0 and epochTime() >= context.deadlineAt:
+    context.cancellation.cancel("deadline exceeded")
+    raise newMcpError("MCP request timed out", mcpInternalErrorCode)
   context.cancellation.checkCancelled()
+
+proc remainingTimeMs*(context: McpContext): int =
+  if context.isNil or context.deadlineAt <= 0: return -1
+  max(0, int((context.deadlineAt - epochTime()) * 1000.0))
 
 proc sealRequestState*(context: McpContext, payload: JsonNode): string =
   if context.isNil or context.requestStateSealer.isNil:
@@ -211,8 +248,26 @@ proc reportProgress*(context: McpContext, progress: float, total = -1.0,
   if context.isNil:
     raise newMcpError("MCP context must not be nil")
   context.checkCancelled()
+  if progress < 0 or total < -1 or (total >= 0 and progress > total):
+    raise newMcpError("MCP progress values are invalid")
+  if context.hasReportedProgress and progress <= context.lastProgress:
+    raise newMcpError("MCP progress must increase")
+  context.lastProgress = progress
+  context.hasReportedProgress = true
   if not context.progress.isNil:
     await context.progress(progress, total, message)
+  if context.hasProgressToken and not context.notificationSender.isNil:
+    var params = %*{
+      "progressToken": toJson(context.progressToken),
+      "progress": progress
+    }
+    if total >= 0: params["total"] = %total
+    if message.len > 0: params["message"] = %message
+    await context.notificationSender(%*{
+      "jsonrpc": mcpJsonRpcVersion,
+      "method": "notifications/progress",
+      "params": params
+    })
 
 proc mintStateHandle*(context: McpContext, value: JsonNode): string =
   if context.isNil or context.stateStore.isNil:

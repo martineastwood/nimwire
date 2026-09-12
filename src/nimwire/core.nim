@@ -11,6 +11,7 @@ const
   mcpInvalidParamsCode* = -32602
   mcpInternalErrorCode* = -32603
   mcpRequestCancelledCode* = -32800
+  mcpServerBusyCode* = -32029
   mcpHeaderMismatchCode* = -32020
   mcpUnsupportedProtocolVersionCode* = -32022
   mcpDefaultMaxMessageBytes* = 1024 * 1024
@@ -22,6 +23,7 @@ const
   mcpMetaClientCapabilitiesKey* = "io.modelcontextprotocol/clientCapabilities"
   mcpMetaTraceContextKey* = "io.modelcontextprotocol/traceContext"
   mcpMetaLogLevelKey* = "io.modelcontextprotocol/logLevel"
+  mcpMetaProgressTokenKey* = "progressToken"
 
 type
   McpError* = object of CatchableError
@@ -76,6 +78,8 @@ type
     traceContext*: McpTraceContext
     hasLogLevel*: bool
     logLevel*: McpLogLevel
+    hasProgressToken*: bool
+    progressToken*: McpId
     extensionMetadata*: JsonNode
 
   McpParams* = object
@@ -406,11 +410,14 @@ proc parseMcpRequestMeta*(node: JsonNode): McpRequestMeta =
       raise newMcpError("request logLevel must be a string")
     result.hasLogLevel = true
     result.logLevel = parseLogLevel(meta[mcpMetaLogLevelKey].getStr)
+  if mcpMetaProgressTokenKey in meta:
+    result.hasProgressToken = true
+    result.progressToken = parseMcpId(meta[mcpMetaProgressTokenKey])
   result.extensionMetadata = newJObject()
   for key, value in meta.pairs:
     if key notin [mcpMetaProtocolVersionKey, mcpMetaClientInfoKey,
                  mcpMetaClientCapabilitiesKey, mcpMetaTraceContextKey,
-                 mcpMetaLogLevelKey]:
+                 mcpMetaLogLevelKey, mcpMetaProgressTokenKey]:
       result.extensionMetadata[key] = value
 
 proc toJson*(value: McpRequestMeta): JsonNode =
@@ -423,6 +430,8 @@ proc toJson*(value: McpRequestMeta): JsonNode =
     result[mcpMetaTraceContextKey] = toJson(value.traceContext)
   if value.hasLogLevel:
     result[mcpMetaLogLevelKey] = %value.logLevel.logLevelName
+  if value.hasProgressToken:
+    result[mcpMetaProgressTokenKey] = toJson(value.progressToken)
 
 proc parseMcpParams*(node: JsonNode): McpParams =
   let params = requireObject(node, "request params")

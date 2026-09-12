@@ -1,12 +1,14 @@
 ## MCP server registry and typed feature dispatch.
 
-import std/[algorithm, asyncdispatch, base64, json, macros, options, strutils]
+import std/[algorithm, asyncdispatch, base64, json, macros, options, strutils,
+            tables, times]
 
 import ./core
 import ./context
 import ./prompts
 import ./resources
 import ./schema
+import ./security
 import ./subscriptions
 
 type
@@ -15,6 +17,9 @@ type
   McpSyncToolHandler* = proc (arguments: JsonNode,
                               context: McpContext): McpToolResult {.closure.}
   McpResourceNotificationHandler* = proc (message: JsonNode) {.closure.}
+  McpToolFilter* = proc (name: string, principal: McpPrincipal): bool {.closure.}
+  McpResourceFilter* = proc (uri: string, principal: McpPrincipal): bool {.closure.}
+  McpPromptFilter* = proc (name: string, principal: McpPrincipal): bool {.closure.}
 
   McpResourceSubscription* = ref object
     id*: McpId
@@ -29,6 +34,7 @@ type
     outputSchema: JsonNode
     title: string
     icons: JsonNode
+    ## Untrusted caller-facing metadata; never use it as an authorization policy.
     annotations: JsonNode
     handler: McpToolHandler
     headerBindings: seq[McpHeaderBinding]
@@ -53,6 +59,12 @@ type
     subscriptions: seq[McpSubscription]
     requestStateSealer: McpRequestStateSealer
     requestStateVerifier: McpRequestStateVerifier
+    activeRequests: Table[string, McpContext]
+    toolTimeouts: Table[string, int]
+    toolFilter: McpToolFilter
+    resourceFilter: McpResourceFilter
+    promptFilter: McpPromptFilter
+    securityLimits: McpSecurityLimits
 
 proc newMcpServer*(name, version: string, instructions = "",
                    listTtlMs = 0, listCacheScope = "private",
@@ -70,11 +82,19 @@ proc newMcpServer*(name, version: string, instructions = "",
     listPageSize: listPageSize,
     eventBus: if eventBus.isNil: newMcpEventBus() else: eventBus,
     requestStateSealer: requestStateSealer,
-    requestStateVerifier: requestStateVerifier)
+    requestStateVerifier: requestStateVerifier,
+    activeRequests: initTable[string, McpContext](),
+    toolTimeouts: initTable[string, int]())
 
 proc resultObject(server: McpServer): McpResult
 proc closeSubscription*(server: McpServer, subscription: McpSubscription,
                         graceful = true): bool
+proc visibleTool(server: McpServer, name: string,
+                 principal: McpPrincipal): bool
+proc visibleResource(server: McpServer, uri: string,
+                     principal: McpPrincipal): bool
+proc visiblePrompt(server: McpServer, name: string,
+                   principal: McpPrincipal): bool
 
 proc validateToolDefinition(name, description: string, inputSchema,
                             outputSchema, icons, annotations: JsonNode):
@@ -125,6 +145,9 @@ macro mcpServer*(name, version: static[string], body: untyped): untyped =
 
 proc addTool*(server: McpServer, tool: McpTool) =
   if server.isNil: raise newMcpError("server must not be nil")
+  if server.securityLimits.maxToolCount > 0 and
+      server.tools.len >= server.securityLimits.maxToolCount:
+    raise newMcpError("tool count exceeds the configured limit")
   for current in server.tools:
     if current.name == tool.name:
       raise newMcpError("duplicate tool name: " & tool.name)
@@ -403,7 +426,8 @@ proc completePromptArgument*(server: McpServer, promptName, argument, prefix: st
                              context: McpContext): Future[seq[string]] {.async.} =
   if server.isNil: raise newMcpError("server must not be nil")
   let index = server.findPrompt(promptName)
-  if index < 0:
+  let principal = if context.isNil: nil else: context.principal
+  if index < 0 or not server.visiblePrompt(promptName, principal):
     raise newMcpError("unknown prompt: " & promptName)
   await server.prompts[index].completePromptArgument(argument, prefix, context)
 
@@ -417,7 +441,8 @@ proc completeResourceTemplate*(server: McpServer, uriTemplate, argument,
                                context: McpContext): Future[seq[string]] {.async.} =
   if server.isNil: raise newMcpError("server must not be nil")
   let index = server.findResourceTemplate(uriTemplate)
-  if index < 0:
+  let principal = if context.isNil: nil else: context.principal
+  if index < 0 or not server.visibleResource(uriTemplate, principal):
     raise newMcpError("unknown resource URI template: " & uriTemplate)
   await server.resourceTemplates[index].completeResourceTemplate(argument,
     prefix, context)
@@ -488,9 +513,13 @@ proc decodeResourceCursor(cursor, prefix: string, itemCount: int): int =
   if result < 0 or result > itemCount:
     raise newMcpError("resource list cursor is out of range")
 
-proc listResources(server: McpServer, params: McpParams): McpResult =
+proc listResources(server: McpServer, params: McpParams,
+                   context: McpContext): McpResult =
   var fields = resultObject(server).fields
-  var resources = server.resources
+  let principal = if context.isNil: nil else: context.principal
+  var resources: seq[McpResource]
+  for resource in server.resources:
+    if server.visibleResource(resource.uri, principal): resources.add resource
   resources.sort(proc (a, b: McpResource): int = cmp(a.uri, b.uri))
   let start = if "cursor" in params.values:
     if params.values["cursor"].kind != JString or
@@ -516,9 +545,14 @@ proc listResources(server: McpServer, params: McpParams): McpResult =
 proc encodeResourceTemplateCursor(index: int): string =
   encode("nimwire.resources.templates.list.v1:" & $index)
 
-proc listResourceTemplates(server: McpServer, params: McpParams): McpResult =
+proc listResourceTemplates(server: McpServer, params: McpParams,
+                           context: McpContext): McpResult =
   var fields = resultObject(server).fields
-  var templates = server.resourceTemplates
+  let principal = if context.isNil: nil else: context.principal
+  var templates: seq[McpResourceTemplate]
+  for resourceTemplate in server.resourceTemplates:
+    if server.visibleResource(resourceTemplate.uriTemplate, principal):
+      templates.add resourceTemplate
   templates.sort(proc (a, b: McpResourceTemplate): int =
     cmp(a.uriTemplate, b.uriTemplate))
   let start = if "cursor" in params.values:
@@ -545,9 +579,13 @@ proc listResourceTemplates(server: McpServer, params: McpParams): McpResult =
 proc encodePromptCursor(index: int): string =
   encode("nimwire.prompts.list.v1:" & $index)
 
-proc listPrompts(server: McpServer, params: McpParams): McpResult =
+proc listPrompts(server: McpServer, params: McpParams,
+                 context: McpContext): McpResult =
   var fields = resultObject(server).fields
-  var prompts = server.prompts
+  let principal = if context.isNil: nil else: context.principal
+  var prompts: seq[McpPrompt]
+  for prompt in server.prompts:
+    if server.visiblePrompt(prompt.name, principal): prompts.add prompt
   prompts.sort(proc (a, b: McpPrompt): int = cmp(a.name, b.name))
   let start = if "cursor" in params.values:
     if params.values["cursor"].kind != JString or
@@ -570,9 +608,13 @@ proc listPrompts(server: McpServer, params: McpParams): McpResult =
   fields["cacheScope"] = %server.listCacheScope
   newMcpResult(mcpComplete, fields)
 
-proc listTools(server: McpServer, params: McpParams): McpResult =
+proc listTools(server: McpServer, params: McpParams,
+               context: McpContext): McpResult =
   var fields = resultObject(server).fields
-  var tools = server.tools
+  let principal = if context.isNil: nil else: context.principal
+  var tools: seq[McpTool]
+  for tool in server.tools:
+    if server.visibleTool(tool.name, principal): tools.add tool
   tools.sort(proc (a, b: McpTool): int = cmp(a.name, b.name))
   let start = if "cursor" in params.values:
     if params.values["cursor"].kind != JString or
@@ -621,6 +663,76 @@ proc findTool*(server: McpServer, name: string): int =
     if tool.name == name: return i
   -1
 
+proc setToolFilter*(server: McpServer, filter: McpToolFilter) =
+  if server.isNil: raise newMcpError("server must not be nil")
+  server.toolFilter = filter
+
+proc setResourceFilter*(server: McpServer, filter: McpResourceFilter) =
+  if server.isNil: raise newMcpError("server must not be nil")
+  server.resourceFilter = filter
+
+proc setPromptFilter*(server: McpServer, filter: McpPromptFilter) =
+  if server.isNil: raise newMcpError("server must not be nil")
+  server.promptFilter = filter
+
+proc setToolTimeout*(server: McpServer, toolName: string, timeoutMs: int) =
+  if server.isNil: raise newMcpError("server must not be nil")
+  if server.findTool(toolName) < 0:
+    raise newMcpError("unknown tool: " & toolName)
+  if timeoutMs < 0:
+    raise newMcpError("tool timeout must be at least 0")
+  if timeoutMs == 0:
+    server.toolTimeouts.del(toolName)
+  else:
+    server.toolTimeouts[toolName] = timeoutMs
+
+proc setSecurityLimits*(server: McpServer, limits: McpSecurityLimits) =
+  if server.isNil: raise newMcpError("server must not be nil")
+  validateSecurityLimits(limits)
+  if limits.maxToolCount > 0 and server.tools.len > limits.maxToolCount:
+    raise newMcpError("existing tool count exceeds the configured limit")
+  server.securityLimits = limits
+
+proc visibleTool(server: McpServer, name: string,
+                 principal: McpPrincipal): bool =
+  server.toolFilter.isNil or server.toolFilter(name, principal)
+
+proc visibleResource(server: McpServer, uri: string,
+                     principal: McpPrincipal): bool =
+  server.resourceFilter.isNil or server.resourceFilter(uri, principal)
+
+proc visiblePrompt(server: McpServer, name: string,
+                   principal: McpPrincipal): bool =
+  server.promptFilter.isNil or server.promptFilter(name, principal)
+
+proc requestKey(id: McpId): string = $toJson(id)
+
+proc trackRequest(server: McpServer, id: McpId, context: McpContext) =
+  if server.securityLimits.maxConcurrentCalls > 0 and
+      server.activeRequests.len >= server.securityLimits.maxConcurrentCalls:
+    raise newMcpError("concurrent request limit reached", mcpServerBusyCode)
+  let key = requestKey(id)
+  if key in server.activeRequests:
+    raise newMcpError("request id is already in progress",
+      mcpInvalidRequestCode)
+  server.activeRequests[key] = context
+
+proc untrackRequest(server: McpServer, id: McpId) =
+  server.activeRequests.del(requestKey(id))
+
+proc cancelRequest*(server: McpServer, id: McpId, reason = ""): bool =
+  if server.isNil: return false
+  let key = requestKey(id)
+  if key notin server.activeRequests: return false
+  server.activeRequests[key].cancel(reason)
+  true
+
+proc cancelActiveRequests*(server: McpServer, reason = "server shutdown"): int =
+  if server.isNil: return 0
+  for context in server.activeRequests.values:
+    context.cancel(reason)
+    inc result
+
 iterator toolHeaderBindings*(server: McpServer,
                              name: string): McpHeaderBinding =
   let index = server.findTool(name)
@@ -637,12 +749,28 @@ proc callTool(server: McpServer, params: McpParams,
   else:
     newJObject()
   let index = server.findTool(name)
-  if index < 0:
+  let principal = if context.isNil: nil else: context.principal
+  if index < 0 or not server.visibleTool(name, principal):
     raise newMcpError("unknown tool: " & name)
   validateJsonValue(server.tools[index].inputSchema, arguments,
     "tool '" & name & "' arguments")
-  let output = await server.tools[index].handler(arguments, context)
-  context.checkCancelled()
+  let configuredTimeout = server.toolTimeouts.getOrDefault(name, 0)
+  let remaining = context.remainingTimeMs()
+  let timeout = if configuredTimeout > 0 and remaining >= 0:
+    min(configuredTimeout, remaining) else: configuredTimeout
+  let previousDeadline = context.deadlineAt
+  if timeout > 0:
+    context.deadlineAt = epochTime() + timeout.float / 1000.0
+  var output: McpToolResult
+  try:
+    let handler = server.tools[index].handler(arguments, context)
+    if timeout > 0 and not await withTimeout(handler, timeout):
+      context.cancel("tool deadline exceeded")
+      raise newMcpError("MCP tool request timed out", mcpInternalErrorCode)
+    output = await handler
+    context.checkCancelled()
+  finally:
+    context.deadlineAt = previousDeadline
   if context.hasInputRequired:
     return context.inputRequired
   if not output.structuredContent.isNil and
@@ -675,7 +803,11 @@ proc readResourceRequest(server: McpServer, params: McpParams,
   validateResourceUri(uri, "resources/read")
   var contents: seq[McpResourceContent]
   var mimeType = ""
+  let principal = if context.isNil: nil else: context.principal
   let resourceIndex = server.findResource(uri)
+  if resourceIndex >= 0 and not server.visibleResource(uri, principal):
+    raise newMcpError("Resource not found", mcpInvalidParamsCode,
+      %*{"uri": uri})
   if resourceIndex >= 0:
     let resource = server.resources[resourceIndex]
     contents = await resource.readResource(uri, context)
@@ -683,6 +815,8 @@ proc readResourceRequest(server: McpServer, params: McpParams,
   else:
     var matched = false
     for resourceTemplate in server.resourceTemplates:
+      if not server.visibleResource(resourceTemplate.uriTemplate, principal):
+        continue
       let arguments = resourceTemplate.matchResourceTemplate(uri)
       if arguments.isNil: continue
       contents = await resourceTemplate.readResourceTemplate(uri, arguments,
@@ -707,7 +841,8 @@ proc getPromptRequest(server: McpServer, params: McpParams,
                       context: McpContext): Future[McpResult] {.async.} =
   let name = requiredString(params.values, "name", "prompts/get params")
   let index = server.findPrompt(name)
-  if index < 0:
+  let principal = if context.isNil: nil else: context.principal
+  if index < 0 or not server.visiblePrompt(name, principal):
     raise newMcpError("Prompt not found", mcpInvalidParamsCode, %*{"name": name})
   let values = if "arguments" in params.values:
     requireObject(params.values["arguments"], "prompts/get arguments")
@@ -781,7 +916,8 @@ proc completeRequest(server: McpServer, params: McpParams,
   of "ref/prompt":
     let name = requiredString(reference, "name", "completion prompt ref")
     let index = server.findPrompt(name)
-    if index < 0:
+    let principal = if context.isNil: nil else: context.principal
+    if index < 0 or not server.visiblePrompt(name, principal):
       raise newMcpError("unknown prompt: " & name)
     let prompt = server.prompts[index]
     for priorName in priorArguments.keys:
@@ -798,8 +934,14 @@ proc completeRequest(server: McpServer, params: McpParams,
   of "ref/resource":
     let uri = requiredString(reference, "uri", "completion resource ref")
     var index = server.findResourceTemplate(uri)
+    let principal = if context.isNil: nil else: context.principal
+    if index >= 0 and not server.visibleResource(uri, principal):
+      index = -1
     if index < 0:
       for candidate in 0 ..< server.resourceTemplates.len:
+        if not server.visibleResource(server.resourceTemplates[candidate].uriTemplate,
+                                      principal):
+          continue
         if not server.resourceTemplates[candidate].matchResourceTemplate(uri).isNil:
           index = candidate
           break
@@ -843,17 +985,17 @@ proc dispatchAsync*(server: McpServer, request: McpRpcRequest,
   of "ping":
     result = server.resultObject()
   of "tools/list":
-    result = server.listTools(request.params)
+    result = server.listTools(request.params, context)
   of "tools/call":
     result = await server.callTool(request.params, context)
   of "resources/list":
-    result = server.listResources(request.params)
+    result = server.listResources(request.params, context)
   of "resources/read":
     result = await server.readResourceRequest(request.params, context)
   of "resources/templates/list":
-    result = server.listResourceTemplates(request.params)
+    result = server.listResourceTemplates(request.params, context)
   of "prompts/list":
-    result = server.listPrompts(request.params)
+    result = server.listPrompts(request.params, context)
   of "prompts/get":
     result = await server.getPromptRequest(request.params, context)
   of "completion/complete":
@@ -861,6 +1003,8 @@ proc dispatchAsync*(server: McpServer, request: McpRpcRequest,
   else:
     raise newMcpError("Method not found: " & request.methodName,
       mcpMethodNotFoundCode)
+  validateJsonSize(result.fields, server.securityLimits.maxContentBytes,
+    "MCP result content")
 
 proc handleMessageAsync*(server: McpServer, message: McpJsonRpcMessage,
                          context: McpContext,
@@ -869,6 +1013,7 @@ proc handleMessageAsync*(server: McpServer, message: McpJsonRpcMessage,
   case message.kind
   of mcpRequestMessage, mcpNotificationMessage:
     let request = message.request
+    var tracked = false
     try:
       server.prepareContext(context)
       server.validateRoundTripRequest(request, context)
@@ -894,11 +1039,18 @@ proc handleMessageAsync*(server: McpServer, message: McpJsonRpcMessage,
       if request.methodName == "notifications/cancelled":
         if "requestId" in request.params.values:
           try:
-            let subscriptionId = parseMcpId(request.params.values["requestId"])
-            discard server.cancelSubscription(subscriptionId)
+            let requestId = parseMcpId(request.params.values["requestId"])
+            let reason = if "reason" in request.params.values and
+                request.params.values["reason"].kind == JString:
+              request.params.values["reason"].getStr else: ""
+            if not server.cancelRequest(requestId, reason):
+              discard server.cancelSubscription(requestId)
           except CatchableError:
             discard
         return none(McpJsonRpcMessage)
+      if request.kind == mcpRequest:
+        server.trackRequest(request.id, context)
+        tracked = true
       let value = await server.dispatchAsync(request, context)
       if request.kind == mcpNotification:
         return none(McpJsonRpcMessage)
@@ -908,11 +1060,14 @@ proc handleMessageAsync*(server: McpServer, message: McpJsonRpcMessage,
         return none(McpJsonRpcMessage)
       return some(errorResponse(request.id, error.code, error.msg, error.data))
     except CatchableError as error:
-      context.log(mcpLogError, error.msg)
+      discard error
+      context.log(mcpLogError, "request failed: " & request.methodName)
       if request.kind == mcpNotification:
         return none(McpJsonRpcMessage)
       return some(errorResponse(request.id, mcpInternalErrorCode,
         "Internal server error"))
+    finally:
+      if tracked: server.untrackRequest(request.id)
   of mcpResponseMessage, mcpErrorMessage:
     some(errorResponse(McpId(kind: mcpNullId), mcpInvalidRequestCode,
       "server accepts requests and notifications only"))
@@ -941,7 +1096,8 @@ proc handleJsonAsync*(server: McpServer,
     return toJson(errorResponse(requestIdOrNull(request), error.code,
       error.msg, error.data))
   except CatchableError as error:
-    context.log(mcpLogError, error.msg)
+    discard error
+    context.log(mcpLogError, "request failed")
     if isNotification:
       return nil
     return toJson(errorResponse(requestIdOrNull(request), mcpInternalErrorCode,

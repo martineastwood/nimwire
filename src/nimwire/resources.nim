@@ -47,6 +47,7 @@ type
     icons*: JsonNode
     mimeType*: string
     size*: int64
+    ## Untrusted caller-facing metadata; never use it as an authorization policy.
     annotations*: JsonNode
     contents*: seq[McpResourceContent]
     readHandler: McpResourceReadHandler
@@ -58,6 +59,7 @@ type
     description*: string
     icons*: JsonNode
     mimeType*: string
+    ## Untrusted caller-facing metadata; never use it as an authorization policy.
     annotations*: JsonNode
     readHandler: McpResourceTemplateReadHandler
     completionHandlers: Table[string, McpResourceCompletionHandler]

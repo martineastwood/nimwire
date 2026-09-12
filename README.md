@@ -17,6 +17,12 @@ Streamable HTTP:
 - stateless multi-round-trip input requests with elicitation, sampling, and
   roots handlers;
 - opt-in `subscriptions/listen` change streams for tools, prompts, and resources;
+- cooperative cancellation, progress notifications, request/tool deadlines,
+  and shutdown cancellation;
+- pluggable HTTP bearer authorization with protected-resource metadata and
+  principal-based feature filters;
+- bounded security controls, redaction helpers, HTTPS URL validation, and
+  confined filesystem helpers;
 - sync and async tool handlers;
 - a small declarative `mcpServer` template/macro API.
 
@@ -26,7 +32,9 @@ protocol primitives, `nimwire/server` for registration and dispatch,
 prompt definitions and messages, and
 `nimwire/transports/stdio` for the stdio transport. `nimwire/context` provides
 request-scoped handler context, `nimwire/mrtr` provides multi-round-trip input
-handling, while `nimwire/testing` provides in-process request helpers.
+handling, `nimwire/auth` provides HTTP authorization hooks, `nimwire/security`
+provides reusable limits and redaction, while `nimwire/testing` provides
+in-process request helpers.
 
 Use `parseMcpMessage` and `toJson` at custom transport boundaries. The parser
 enforces a 1 MiB message limit and 64 levels of nesting by default; both are
@@ -108,3 +116,19 @@ or resource handler when more client input is needed. `McpInputClient` validates
 elicitation form responses, preserves opaque `requestState`, and creates a fresh
 JSON-RPC ID for each retry. Configure `requestStateSealer` and
 `requestStateVerifier` on `newMcpServer` when state needs authenticated sealing.
+
+Handlers can call `context.checkCancelled()` and `context.reportProgress(...)`.
+When request metadata contains `progressToken`, progress is emitted as a wire
+notification through the transport's notification sender. Set
+`server.setToolTimeout` for a per-tool deadline and call `server.cancelRequest`
+or `server.cancelActiveRequests` during shutdown. HTTP adapters should call
+`request.cancellation.cancel("client disconnected")` when their framework
+reports a closed request stream.
+
+Remote HTTP authorization is opt-in. Pass an `McpAuthorizationConfig` to
+`newMcpHttpConfig`; its verifier receives the bearer token and resource and
+returns validated claims. Protected-resource metadata is served from
+`/.well-known/oauth-protected-resource/<endpoint>`. Use
+`server.setToolFilter`, `setResourceFilter`, and `setPromptFilter` for
+principal-based visibility. See [examples/auth_server.nim](examples/auth_server.nim)
+and [SECURITY.md](SECURITY.md) before exposing a server publicly.

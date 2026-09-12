@@ -5,6 +5,7 @@ import std/[asynchttpserver, asyncdispatch, asyncnet, base64, json, nativesocket
 
 import ../core
 import ../context
+import ../auth
 import ../server
 import ../subscriptions
 
@@ -28,6 +29,10 @@ type
     stateStore*: McpStateStore
     logger*: McpLogger
     progress*: McpProgressReporter
+    cancellation*: McpCancellation
+    notificationSender*: McpNotificationSender
+    streamResponses*: bool
+    timeoutMs*: int
     streamWriter*: McpHttpStreamWriter
     streamCloser*: McpHttpStreamCloser
 
@@ -49,6 +54,7 @@ type
     allowedHosts*: seq[string]
     allowedOrigins*: seq[string]
     preferSse*: bool
+    authorization*: McpAuthorizationConfig
 
   McpHttpServer* = ref object
     app: McpServer
@@ -65,7 +71,8 @@ proc newMcpHttpConfig*(endpoint = "/mcp", host = "127.0.0.1",
                        requestTimeoutMs = 0, maxConcurrentRequests = 0,
                        allowedHosts: seq[string] = @[],
                        allowedOrigins: seq[string] = @[],
-                       preferSse = false): McpHttpConfig =
+                       preferSse = false,
+                       authorization = McpAuthorizationConfig()): McpHttpConfig =
   if endpoint.len == 0 or not endpoint.startsWith("/"):
     raise newMcpError("HTTP endpoint must start with '/'")
   if maxBodyBytes < 1:
@@ -81,12 +88,13 @@ proc newMcpHttpConfig*(endpoint = "/mcp", host = "127.0.0.1",
     requestTimeoutMs: requestTimeoutMs,
     maxConcurrentRequests: maxConcurrentRequests,
     allowedHosts: allowedHosts, allowedOrigins: allowedOrigins,
-    preferSse: preferSse)
+    preferSse: preferSse, authorization: authorization)
 
 proc newMcpHttpRequest*(httpMethod, path: string, body = "",
                         headers: seq[McpHttpHeader] = @[]): McpHttpRequest =
   McpHttpRequest(httpMethod: httpMethod, path: path, headers: headers,
-    body: body, transport: McpTransportInfo(kind: mcpTransportHttp,
+    body: body, cancellation: newMcpCancellation(),
+    transport: McpTransportInfo(kind: mcpTransportHttp,
       name: "http", endpoint: path))
 
 proc header*(name, value: string): McpHttpHeader =
@@ -126,8 +134,11 @@ proc addCors(response: var McpHttpResponse, request: McpHttpRequest,
   if origin.len > 0 and originAllowed:
     response.headers.addHeader("Access-Control-Allow-Origin", origin)
     response.headers.addHeader("Access-Control-Allow-Headers",
-      "Content-Type, MCP-Protocol-Version, Mcp-Method, Mcp-Name, Mcp-Param-*")
+      "Authorization, Content-Type, MCP-Protocol-Version, Mcp-Method, " &
+      "Mcp-Name, Mcp-Param-*")
     response.headers.addHeader("Access-Control-Allow-Methods", "POST, OPTIONS")
+    response.headers.addHeader("Access-Control-Expose-Headers",
+      "WWW-Authenticate")
     response.headers.addHeader("Vary", "Origin")
 
 proc isHttpTokenCharacter(character: char): bool =
@@ -184,6 +195,26 @@ proc allowedOrigin(config: McpHttpConfig, request: McpHttpRequest): bool =
 proc endpointPath(path: string): string =
   let query = path.find('?')
   if query < 0: path else: path[0 ..< query]
+
+proc isProtectedResourceMetadataPath(config: McpHttpConfig, path: string): bool =
+  let base = "/.well-known/oauth-protected-resource"
+  endpointPath(path) == base or endpointPath(path) == base & config.endpoint
+
+proc authorizationHeaders(request: McpHttpRequest): seq[McpAuthHeader] =
+  for item in request.headers:
+    result.add McpAuthHeader(name: item.name, value: item.value)
+
+proc authorizationFailureResponse(config: McpHttpConfig,
+                                  request: McpHttpRequest,
+                                  decision: McpAuthorizationResult): McpHttpResponse =
+  let challenge = if decision.status == 403:
+    authorizationChallenge(config.authorization, "insufficient_scope",
+      decision.scopes.join(" "))
+  else:
+    authorizationChallenge(config.authorization)
+  result = jsonError(McpId(kind: mcpNullId), decision.status,
+    mcpInvalidRequestCode, decision.message)
+  result.headers.addHeader("WWW-Authenticate", challenge)
 
 proc accepts(headers: openArray[McpHttpHeader], mediaType: string): bool =
   for value in headerValues(headers, "Accept"):
@@ -348,15 +379,30 @@ proc handleHttpRequest*(server: McpServer, request: McpHttpRequest,
     return withCors(plainResponse(403, "Forbidden host"), request, false)
   if not originOkay:
     return withCors(plainResponse(403, "Forbidden origin"), request, false)
+  let httpVerb = request.httpMethod.toUpperAscii
+  if isProtectedResourceMetadataPath(config, request.path):
+    if httpVerb != "GET" or not config.authorization.enabled:
+      return withCors(plainResponse(404, "Not Found"), request, true)
+    let metadata = config.authorization.protectedResourceMetadata()
+    return withCors(jsonResponse(200, $toJson(metadata)), request, true)
   if endpointPath(request.path) != config.endpoint:
     return withCors(plainResponse(404, "Not Found"), request, true)
 
-  if request.httpMethod.toUpperAscii == "OPTIONS":
+  if httpVerb == "OPTIONS":
     return withCors(McpHttpResponse(status: 204), request, true)
-  if request.httpMethod.toUpperAscii != "POST":
+  if httpVerb != "POST":
     var response = plainResponse(405, "Method Not Allowed")
     response.headers.addHeader("Allow", "POST, OPTIONS")
     return withCors(response, request, true)
+  var principal = request.principal
+  if config.authorization.enabled:
+    let decision = config.authorization.authorize(
+      newMcpAuthorizationRequest(httpVerb, endpointPath(request.path),
+        config.authorization.resource, authorizationHeaders(request)))
+    if not decision.allowed:
+      return withCors(authorizationFailureResponse(config, request, decision),
+        request, true)
+    principal = decision.principal
   if request.body.len > config.maxBodyBytes:
     return withCors(jsonError(McpId(kind: mcpNullId), 413, mcpParseErrorCode,
       "JSON message exceeds maximum size"), request, true)
@@ -397,19 +443,24 @@ proc handleHttpRequest*(server: McpServer, request: McpHttpRequest,
     return withCors(jsonError(requestId, 400, error.code, error.msg, error.data),
       request, true)
 
+  let timeoutMs = if request.timeoutMs > 0 and config.requestTimeoutMs > 0:
+    min(request.timeoutMs, config.requestTimeoutMs)
+  elif request.timeoutMs > 0: request.timeoutMs
+  else: config.requestTimeoutMs
   let context = newMcpContext(rpcRequest, request.transport,
-    principal = request.principal, extensionState = request.extensionState,
+    cancellation = request.cancellation, principal = principal,
+    extensionState = request.extensionState,
     stateStore = request.stateStore, logger = request.logger,
-    progress = request.progress)
+    progress = request.progress, notificationSender = request.notificationSender,
+    deadlineMs = timeoutMs)
   if rpcRequest.methodName == "subscriptions/listen" and
       not request.streamWriter.isNil:
     let dispatch = server.handleMessageAsync(message, context,
       proc (notification: JsonNode) =
         asyncCheck forwardStreamMessage(server, request.streamWriter,
           requestId, notification))
-    if config.requestTimeoutMs > 0 and
-        not await withTimeout(dispatch, config.requestTimeoutMs):
-      context.cancel()
+    if timeoutMs > 0 and not await withTimeout(dispatch, timeoutMs):
+      context.cancel("HTTP request timeout")
       return withCors(jsonError(requestId, 408, mcpInternalErrorCode,
         "MCP request timed out"), request, true)
     let output = await dispatch
@@ -421,9 +472,8 @@ proc handleHttpRequest*(server: McpServer, request: McpHttpRequest,
     return withCors(McpHttpResponse(status: 200, streamed: true,
       subscriptionId: requestId), request, true)
   let dispatch = server.handleMessageAsync(message, context)
-  if config.requestTimeoutMs > 0 and
-      not await withTimeout(dispatch, config.requestTimeoutMs):
-    context.cancel()
+  if timeoutMs > 0 and not await withTimeout(dispatch, timeoutMs):
+    context.cancel("HTTP request timeout")
     return withCors(jsonError(requestId, 408, mcpInternalErrorCode,
       "MCP request timed out"), request, true)
   let output = await dispatch
@@ -432,6 +482,10 @@ proc handleHttpRequest*(server: McpServer, request: McpHttpRequest,
   let value = toJson(output.get)
   let status = if output.get.kind == mcpErrorMessage and
       output.get.errorResponse.error.code == mcpMethodNotFoundCode: 404 else: 200
+  if request.streamResponses and not request.streamWriter.isNil:
+    await request.streamWriter(value)
+    return withCors(McpHttpResponse(status: status, streamed: true,
+      subscriptionId: requestId), request, true)
   var response = jsonResponse(status, $value)
   if config.preferSse:
     response = response.addSseMessage(value)
@@ -500,7 +554,10 @@ proc handleStdlibRequest(server: McpHttpServer,
     return
   inc server.activeRequests
   try:
-    let adaptedRequest = toMcpHttpRequest(request)
+    var adaptedRequest = toMcpHttpRequest(request)
+    if server.config.preferSse:
+      adaptedRequest.streamResponses = true
+      adaptedRequest.notificationSender = adaptedRequest.streamWriter
     let response = await handleHttpRequest(server.app,
       adaptedRequest, server.config)
     if response.streamed:
@@ -537,6 +594,7 @@ proc serveHttp*(server: McpHttpServer): Future[void] {.async.} =
   finally:
     if not server.stopping:
       server.stopping = true
+    discard server.app.cancelActiveRequests()
     discard server.app.closeSubscriptions()
     server.transport.close()
   while server.activeRequests > 0:
@@ -545,6 +603,7 @@ proc serveHttp*(server: McpHttpServer): Future[void] {.async.} =
 proc shutdown*(server: McpHttpServer) =
   if server.isNil: return
   server.stopping = true
+  discard server.app.cancelActiveRequests()
   discard server.app.closeSubscriptions()
   if server.started:
     server.transport.close()
