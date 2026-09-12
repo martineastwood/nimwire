@@ -5,12 +5,15 @@
 
 import ./nimwire/core
 import ./nimwire/context
+import ./nimwire/mrtr
 import ./nimwire/prompts
 import ./nimwire/resources
 import ./nimwire/schema
 import ./nimwire/server
+import ./nimwire/subscriptions
 import ./nimwire/testing
 import ./nimwire/transports/stdio
 import ./nimwire/transports/http
 
-export core, context, prompts, resources, schema, server, testing, stdio, http
+export core, context, mrtr, prompts, resources, schema, server, subscriptions,
+  testing, stdio, http

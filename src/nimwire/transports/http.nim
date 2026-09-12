@@ -1,13 +1,17 @@
 ## Stateless Streamable HTTP transport.
 
-import std/[asynchttpserver, asyncdispatch, base64, json, nativesockets,
+import std/[asynchttpserver, asyncdispatch, asyncnet, base64, json, nativesockets,
             options, strutils, unicode, uri]
 
 import ../core
 import ../context
 import ../server
+import ../subscriptions
 
 type
+  McpHttpStreamWriter* = proc (message: JsonNode): Future[void] {.closure.}
+  McpHttpStreamCloser* = proc (): Future[void] {.closure.}
+
   McpHttpHeader* = object
     name*: string
     value*: string
@@ -24,11 +28,15 @@ type
     stateStore*: McpStateStore
     logger*: McpLogger
     progress*: McpProgressReporter
+    streamWriter*: McpHttpStreamWriter
+    streamCloser*: McpHttpStreamCloser
 
   McpHttpResponse* = object
     status*: int
     headers*: seq[McpHttpHeader]
     body*: string
+    streamed*: bool
+    subscriptionId*: McpId
 
   McpHttpConfig* = object
     endpoint*: string
@@ -322,6 +330,14 @@ proc withCors(response: McpHttpResponse, request: McpHttpRequest,
   result = response
   result.addCors(request, originAllowed)
 
+proc forwardStreamMessage(server: McpServer, writer: McpHttpStreamWriter,
+                          subscriptionId: McpId,
+                          message: JsonNode): Future[void] {.async.} =
+  try:
+    await writer(message)
+  except CatchableError:
+    discard server.cancelSubscription(subscriptionId)
+
 proc handleHttpRequest*(server: McpServer, request: McpHttpRequest,
                         config = newMcpHttpConfig()): Future[McpHttpResponse] {.async.} =
   let originOkay = allowedOrigin(config, request)
@@ -385,6 +401,25 @@ proc handleHttpRequest*(server: McpServer, request: McpHttpRequest,
     principal = request.principal, extensionState = request.extensionState,
     stateStore = request.stateStore, logger = request.logger,
     progress = request.progress)
+  if rpcRequest.methodName == "subscriptions/listen" and
+      not request.streamWriter.isNil:
+    let dispatch = server.handleMessageAsync(message, context,
+      proc (notification: JsonNode) =
+        asyncCheck forwardStreamMessage(server, request.streamWriter,
+          requestId, notification))
+    if config.requestTimeoutMs > 0 and
+        not await withTimeout(dispatch, config.requestTimeoutMs):
+      context.cancel()
+      return withCors(jsonError(requestId, 408, mcpInternalErrorCode,
+        "MCP request timed out"), request, true)
+    let output = await dispatch
+    if output.isSome:
+      let value = toJson(output.get)
+      let status = if output.get.kind == mcpErrorMessage and
+          output.get.errorResponse.error.code == mcpMethodNotFoundCode: 404 else: 200
+      return withCors(jsonResponse(status, $value), request, true)
+    return withCors(McpHttpResponse(status: 200, streamed: true,
+      subscriptionId: requestId), request, true)
   let dispatch = server.handleMessageAsync(message, context)
   if config.requestTimeoutMs > 0 and
       not await withTimeout(dispatch, config.requestTimeoutMs):
@@ -407,6 +442,36 @@ proc toMcpHttpRequest*(request: asynchttpserver.Request): McpHttpRequest =
   result.transport.remoteAddress = request.hostname
   for name, value in request.headers.pairs:
     result.headers.add McpHttpHeader(name: name, value: value)
+  let client = request.client
+  var started = false
+  var tail = newFuture[void]("mcpHttpStream")
+  tail.complete()
+  result.streamWriter = proc (message: JsonNode): Future[void] {.async.} =
+    let previous = tail
+    let current = newFuture[void]("mcpHttpStreamMessage")
+    tail = current
+    await previous
+    if not started:
+      try:
+        await client.send("HTTP/1.1 200 OK\r\n" &
+          "Content-Type: text/event-stream; charset=utf-8\r\n" &
+          "Cache-Control: no-cache\r\n" &
+          "Connection: keep-alive\r\n" &
+          "Transfer-Encoding: chunked\r\n\r\n")
+        started = true
+      except CatchableError:
+        current.complete()
+        raise
+    try:
+      let body = "event: message\r\ndata: " & $message & "\r\n\r\n"
+      let chunk = toHex(body.len, 1) & "\r\n" & body & "\r\n"
+      await client.send(chunk)
+    finally:
+      if not current.finished: current.complete()
+  result.streamCloser = proc (): Future[void] {.async.} =
+    await tail
+    if started:
+      await client.send("0\r\n\r\n")
 
 proc toHttpHeaders(headers: seq[McpHttpHeader]): HttpHeaders =
   result = newHttpHeaders()
@@ -435,10 +500,18 @@ proc handleStdlibRequest(server: McpHttpServer,
     return
   inc server.activeRequests
   try:
+    let adaptedRequest = toMcpHttpRequest(request)
     let response = await handleHttpRequest(server.app,
-      toMcpHttpRequest(request), server.config)
-    await request.respond(HttpCode(response.status), response.body,
-      toHttpHeaders(response.headers))
+      adaptedRequest, server.config)
+    if response.streamed:
+      let subscription = server.app.findSubscription(response.subscriptionId)
+      if not subscription.isNil:
+        await subscription.waitClosed()
+      if not adaptedRequest.streamCloser.isNil:
+        await adaptedRequest.streamCloser()
+    else:
+      await request.respond(HttpCode(response.status), response.body,
+        toHttpHeaders(response.headers))
   except CatchableError:
     try:
       await request.respond(Http500, "Internal Server Error")
@@ -464,12 +537,14 @@ proc serveHttp*(server: McpHttpServer): Future[void] {.async.} =
   finally:
     if not server.stopping:
       server.stopping = true
-      server.transport.close()
+    discard server.app.closeSubscriptions()
+    server.transport.close()
   while server.activeRequests > 0:
     await sleepAsync(10)
 
 proc shutdown*(server: McpHttpServer) =
   if server.isNil: return
   server.stopping = true
+  discard server.app.closeSubscriptions()
   if server.started:
     server.transport.close()

@@ -13,7 +13,7 @@ const supportedSchemaKeywords = [
   "oneOf", "not", "enum", "const", "minLength", "maxLength",
   "minItems", "maxItems", "uniqueItems", "minProperties", "maxProperties",
   "minimum", "exclusiveMinimum", "maximum", "exclusiveMaximum",
-  "x-mcp-header"]
+  "format", "x-mcp-header"]
 
 type
   McpHeaderBinding* = object
@@ -132,6 +132,8 @@ proc validateSchemaNode(node: JsonNode, path: string) =
     raise schemaFailure(path, "$schema must be a string")
   if "$id" in schema and schema["$id"].kind != JString:
     raise schemaFailure(path, "$id must be a string")
+  if "format" in schema and schema["format"].kind != JString:
+    raise schemaFailure(path, "format must be a string")
   if "type" in schema:
     let value = schema["type"]
     if value.kind == JString:

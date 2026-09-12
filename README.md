@@ -13,6 +13,10 @@ Streamable HTTP:
 - static and dynamic resources, URI templates, binary contents, and safe file
   resource helpers;
 - typed prompts with text, media, resource-link, and embedded-resource messages;
+- prompt and resource-template completion with bounded result hints;
+- stateless multi-round-trip input requests with elicitation, sampling, and
+  roots handlers;
+- opt-in `subscriptions/listen` change streams for tools, prompts, and resources;
 - sync and async tool handlers;
 - a small declarative `mcpServer` template/macro API.
 
@@ -21,8 +25,8 @@ protocol primitives, `nimwire/server` for registration and dispatch,
 `nimwire/resources` for resource definitions and helpers, `nimwire/prompts` for
 prompt definitions and messages, and
 `nimwire/transports/stdio` for the stdio transport. `nimwire/context` provides
-request-scoped handler context, while `nimwire/testing` provides in-process
-request helpers.
+request-scoped handler context, `nimwire/mrtr` provides multi-round-trip input
+handling, while `nimwire/testing` provides in-process request helpers.
 
 Use `parseMcpMessage` and `toJson` at custom transport boundaries. The parser
 enforces a 1 MiB message limit and 64 levels of nesting by default; both are
@@ -76,8 +80,10 @@ Use `newMcpResourceTemplate` for parameterized resources and
 traversal and symlink escapes before a file is read. See
 `examples/resources_server.nim` for file, generated-data, database-schema,
 and HTTP URL examples. Resource change subscriptions receive wire-ready
-notification JSON through `subscribeResources`; call `markResourcesChanged`
-or `markResourceUpdated` after application data changes.
+notification JSON through `subscriptions/listen`; call `markToolsChanged`,
+`markPromptsChanged`, `markResourcesChanged`, or `markResourceUpdated` after
+application data changes. Supply `eventBus = newMcpEventBus(...)` to
+`newMcpServer` when change events need an external publisher.
 
 Prompts expose typed string arguments and MCP message content:
 
@@ -92,3 +98,13 @@ server.addPrompt mcpPrompt("review",
 
 Use `server.addPromptCompletion` to attach a completion hook to a declared
 prompt argument; `prompts/list` and `prompts/get` are dispatched by the server.
+The `completion/complete` endpoint accepts `ref/prompt` and `ref/resource`
+references and returns at most 100 suggestions with `total` and `hasMore`
+hints. Completion handlers can inspect prior values through
+`context.completionArguments`.
+
+Use `context.requireInput(newMcpInputRequiredResult(...))` from a tool, prompt,
+or resource handler when more client input is needed. `McpInputClient` validates
+elicitation form responses, preserves opaque `requestState`, and creates a fresh
+JSON-RPC ID for each retry. Configure `requestStateSealer` and
+`requestStateVerifier` on `newMcpServer` when state needs authenticated sealing.

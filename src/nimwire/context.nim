@@ -26,6 +26,10 @@ type
   McpLogger* = proc (level: McpLogLevel, message: string) {.closure.}
   McpProgressReporter* = proc (progress, total: float,
                                message: string): Future[void] {.closure.}
+  McpRequestStateSealer* = proc (payload: JsonNode,
+                                 context: McpContext): string {.closure.}
+  McpRequestStateVerifier* = proc (state: string,
+                                   context: McpContext): JsonNode {.closure.}
 
   McpStateClaim* = object
     subject*: string
@@ -48,7 +52,16 @@ type
     transport*: McpTransportInfo
     principal*: McpPrincipal
     extensionState*: JsonNode
+    completionArguments*: JsonNode
+    inputResponses*: JsonNode
+    hasRequestState*: bool
+    requestState*: string
+    requestStatePayload*: JsonNode
+    requestStateSealer*: McpRequestStateSealer
+    requestStateVerifier*: McpRequestStateVerifier
     stateStore*: McpStateStore
+    hasInputRequired*: bool
+    inputRequired*: McpResult
 
 proc newMcpPrincipal*(subject: string, claims: JsonNode = nil): McpPrincipal =
   if subject.len == 0:
@@ -124,7 +137,9 @@ proc newMcpContext*(request: McpRpcRequest,
                     extensionState: JsonNode = nil,
                     stateStore: McpStateStore = nil,
                     logger: McpLogger = nil,
-                    progress: McpProgressReporter = nil): McpContext =
+                    progress: McpProgressReporter = nil,
+                    requestStateSealer: McpRequestStateSealer = nil,
+                    requestStateVerifier: McpRequestStateVerifier = nil): McpContext =
   McpContext(
     requestId: if request.kind == mcpRequest: request.id else:
       McpId(kind: mcpNullId),
@@ -136,6 +151,14 @@ proc newMcpContext*(request: McpRpcRequest,
     transport: transport,
     principal: principal,
     extensionState: if extensionState.isNil: newJObject() else: extensionState,
+    completionArguments: newJObject(),
+    inputResponses: if "inputResponses" in request.params.values:
+      request.params.values["inputResponses"] else: newJObject(),
+    hasRequestState: "requestState" in request.params.values,
+    requestState: if "requestState" in request.params.values:
+      request.params.values["requestState"].getStr else: "",
+    requestStateSealer: requestStateSealer,
+    requestStateVerifier: requestStateVerifier,
     stateStore: stateStore)
 
 proc cancel*(context: McpContext) =
@@ -148,6 +171,36 @@ proc checkCancelled*(context: McpContext) =
   if context.isNil:
     raise newMcpError("MCP context must not be nil")
   context.cancellation.checkCancelled()
+
+proc sealRequestState*(context: McpContext, payload: JsonNode): string =
+  if context.isNil or context.requestStateSealer.isNil:
+    raise newMcpError("MCP request state sealer is not configured")
+  result = context.requestStateSealer(payload, context)
+  if result.len == 0:
+    raise newMcpError("MCP request state sealer returned an empty state")
+
+proc verifyRequestState*(context: McpContext): JsonNode =
+  if context.isNil or not context.hasRequestState or
+      context.requestStateVerifier.isNil:
+    return nil
+  result = context.requestStateVerifier(context.requestState, context)
+  if result.isNil:
+    raise newMcpError("MCP request state verification failed")
+  context.requestStatePayload = result
+
+proc requireInput*(context: McpContext, value: McpResult) =
+  if context.isNil:
+    raise newMcpError("MCP context must not be nil")
+  if value.resultType != mcpInputRequired:
+    raise newMcpError("input requirement must use mcpInputRequired")
+  context.inputRequired = value
+  context.hasInputRequired = true
+
+proc inputResponse*(context: McpContext, key: string): JsonNode =
+  if context.isNil or context.inputResponses.isNil or
+      context.inputResponses.kind != JObject or key notin context.inputResponses:
+    return nil
+  context.inputResponses[key]
 
 proc log*(context: McpContext, level: McpLogLevel, message: string) =
   if not context.isNil and not context.logger.isNil:

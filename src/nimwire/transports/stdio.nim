@@ -6,9 +6,12 @@ import ../core
 import ../context
 import ../server
 
-proc writeResponse(message: McpJsonRpcMessage) =
-  stdout.writeLine($toJson(message))
+proc writeJson(message: JsonNode) =
+  stdout.writeLine($message)
   flushFile(stdout)
+
+proc writeResponse(message: McpJsonRpcMessage) =
+  writeJson(toJson(message))
 
 proc serveStdio*(server: McpServer,
                  maxMessageBytes = mcpDefaultMaxMessageBytes,
@@ -22,7 +25,11 @@ proc serveStdio*(server: McpServer,
       let output = if message.kind in {mcpRequestMessage, mcpNotificationMessage}:
         let context = newMcpContext(message.request,
           McpTransportInfo(kind: mcpTransportStdio, name: "stdio"))
-        waitFor server.handleMessageAsync(message, context)
+        if message.request.methodName == "subscriptions/listen":
+          waitFor server.handleMessageAsync(message, context,
+            proc (notification: JsonNode) = writeJson(notification))
+        else:
+          waitFor server.handleMessageAsync(message, context)
       else:
         waitFor server.handleMessageAsync(message, nil)
       if output.isSome:

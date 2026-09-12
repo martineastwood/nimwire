@@ -15,6 +15,7 @@ const
   mcpUnsupportedProtocolVersionCode* = -32022
   mcpDefaultMaxMessageBytes* = 1024 * 1024
   mcpDefaultMaxNestingDepth* = 64
+  mcpDefaultCompletionLimit* = 100
 
   mcpMetaProtocolVersionKey* = "io.modelcontextprotocol/protocolVersion"
   mcpMetaClientInfoKey* = "io.modelcontextprotocol/clientInfo"
@@ -81,6 +82,12 @@ type
     ## `values` contains method-specific params; `_meta` is decoded into `meta`.
     values*: JsonNode
     meta*: McpRequestMeta
+
+  McpInputRequest* = object
+    ## A server-to-client request embedded in an input_required result.
+    methodName*: string
+    params*: JsonNode
+    extraFields*: JsonNode
 
   McpResultType* = enum
     mcpComplete
@@ -214,7 +221,33 @@ proc parseResultType(value: string): McpResultType =
   of "input_required": mcpInputRequired
   else: raise invalidRequest("resultType must be complete or input_required")
 
-proc validateResultFields(fields: JsonNode) =
+proc inputRequestMethod(methodName: string): bool =
+  methodName in ["elicitation/create", "sampling/createMessage", "roots/list"]
+
+proc validateInputRequests(value: JsonNode) =
+  if value.kind != JObject:
+    raise invalidRequest("inputRequests must be an object")
+  for key, request in value.pairs:
+    if key.len == 0:
+      raise invalidRequest("inputRequests keys must not be empty")
+    if request.kind != JObject or "method" notin request or
+        request["method"].kind != JString or
+        not inputRequestMethod(request["method"].getStr):
+      raise invalidRequest("inputRequests values must be supported request objects")
+    if "params" in request and request["params"].kind != JObject:
+      raise invalidRequest("input request params must be an object")
+
+proc validateInputResponses(value: JsonNode) =
+  if value.kind != JObject:
+    raise invalidRequest("inputResponses must be an object")
+  for key, response in value.pairs:
+    if key.len == 0 or response.kind != JObject:
+      raise invalidRequest("inputResponses values must be objects")
+    if "action" in response and (response["action"].kind != JString or
+        response["action"].getStr notin ["accept", "decline", "cancel"]):
+      raise invalidRequest("input response action must be accept, decline, or cancel")
+
+proc validateResultFields(resultType: McpResultType, fields: JsonNode) =
   if fields.isNil or fields.kind != JObject:
     raise invalidRequest("JSON-RPC result must be an object")
   if "_meta" in fields and fields["_meta"].kind != JObject:
@@ -223,12 +256,20 @@ proc validateResultFields(fields: JsonNode) =
     raise invalidRequest("result content must be an array")
   if "isError" in fields and fields["isError"].kind != JBool:
     raise invalidRequest("result isError must be a boolean")
+  if resultType == mcpInputRequired:
+    if "inputRequests" in fields:
+      validateInputRequests(fields["inputRequests"])
+    if "requestState" in fields and (fields["requestState"].kind != JString or
+        fields["requestState"].getStr.len == 0):
+      raise invalidRequest("requestState must be a non-empty string")
+    if "inputRequests" notin fields and "requestState" notin fields:
+      raise invalidRequest("input_required result requires inputRequests or requestState")
 
 proc newMcpResult*(resultType: McpResultType,
                    fields: JsonNode = nil): McpResult =
   result.resultType = resultType
   result.fields = if fields.isNil: newJObject() else: fields
-  validateResultFields(result.fields)
+  validateResultFields(resultType, result.fields)
 
 proc parseMcpResult*(node: JsonNode): McpResult =
   let value = requireProtocolObject(node, "JSON-RPC result")
@@ -236,7 +277,7 @@ proc parseMcpResult*(node: JsonNode): McpResult =
     raise invalidRequest("JSON-RPC result requires a string resultType")
   result.resultType = parseResultType(value["resultType"].getStr)
   result.fields = withoutKey(value, "resultType")
-  validateResultFields(result.fields)
+  validateResultFields(result.resultType, result.fields)
 
 proc toJson*(value: McpResult): JsonNode =
   result = copyObject(value.fields)
@@ -389,6 +430,12 @@ proc parseMcpParams*(node: JsonNode): McpParams =
     raise newMcpError("request params require _meta")
   result.meta = parseMcpRequestMeta(params["_meta"])
   result.values = withoutKey(params, "_meta")
+  if "inputResponses" in result.values:
+    validateInputResponses(result.values["inputResponses"])
+  if "requestState" in result.values and
+      (result.values["requestState"].kind != JString or
+       result.values["requestState"].getStr.len == 0):
+    raise newMcpError("requestState must be a non-empty string")
 
 proc toJson*(value: McpParams): JsonNode =
   result = copyObject(value.values)

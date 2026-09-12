@@ -416,6 +416,38 @@ suite "nimwire Streamable HTTP":
     waitFor sleepAsync(30)
     check cancelled
 
+  test "streams subscription messages through a framework writer":
+    let server = newMcpServer("http-subscriptions", "1.0.0")
+    let toolHandler: McpSyncToolHandler = proc (
+        arguments: JsonNode,
+        ignoredContext: McpContext): McpToolResult = textResult("ok")
+    server.addTool newMcpTool("one", "One", %*{"type": "object"},
+      toolHandler)
+    server.markToolsChanged()
+    var streamed: seq[JsonNode]
+    var request = newMcpHttpRequest("POST", "/mcp",
+      $modernRequest(10, "subscriptions/listen", %*{
+        "notifications": {"toolsListChanged": true}
+      }), httpHeaders("subscriptions/listen"))
+    request.streamWriter = proc (message: JsonNode): Future[void] {.async.} =
+      streamed.add message
+    let response = waitFor server.handleHttpRequest(request)
+    waitFor sleepAsync(0)
+    check response.streamed
+    check response.subscriptionId.integerValue == 10
+    check streamed.len == 1
+    check streamed[0]["method"].getStr ==
+      "notifications/subscriptions/acknowledged"
+    server.markToolsChanged()
+    waitFor sleepAsync(0)
+    check streamed.len == 2
+    check streamed[1]["method"].getStr ==
+      "notifications/tools/list_changed"
+    discard server.closeSubscriptions()
+    waitFor sleepAsync(0)
+    check streamed.len == 3
+    check streamed[2]["id"].getInt == 10
+
 suite "nimwire request context":
   test "hides unexpected handler errors and logs them":
     var loggedMessage = ""
@@ -731,3 +763,372 @@ suite "nimwire prompts":
     let response = server.handleJson(modernRequest(59, "server/discover"))
     check response["result"]["capabilities"]["prompts"][
       "listChanged"].getBool
+
+suite "nimwire completion":
+  test "completes prompt and resource-template arguments":
+    let server = newMcpServer("completion", "1.0.0")
+    let promptHandler: McpSyncPromptSingleHandler = proc (
+        arguments: McpPromptArguments,
+        ignoredContext: McpContext): McpPromptMessage = userText("ok")
+    server.addPrompt newMcpPrompt("review", promptHandler,
+      arguments = @[
+        newMcpPromptArgument("language"),
+        newMcpPromptArgument("code")])
+    let promptCompletion: McpSyncPromptCompletionHandler = proc (
+        argument, prefix: string,
+        context: McpContext): seq[string] =
+      @[prefix & context.completionArguments["code"].getStr]
+    server.addPromptCompletion("review", "language", promptCompletion)
+
+    var resourceTemplate = newMcpResourceTemplate("demo:///{owner}/{name}",
+      "Demo", proc (uri: string, arguments: JsonNode,
+                     ignoredContext: McpContext): seq[McpResourceContent] = @[])
+    let resourceCompletion: McpSyncResourceCompletionHandler = proc (
+        argument, prefix: string,
+        ignoredContext: McpContext): seq[string] = @[prefix & "-team"]
+    resourceTemplate.addCompletion("owner", resourceCompletion)
+    server.addResourceTemplate(resourceTemplate)
+
+    var response = server.handleJson(modernRequest(60, "server/discover"))
+    check response["result"]["capabilities"]["completions"].kind == JObject
+    response = server.handleJson(modernRequest(61, "completion/complete", %*{
+      "ref": {"type": "ref/prompt", "name": "review"},
+      "argument": {"name": "language", "value": "py"},
+      "context": {"arguments": {"code": "discard"}}
+    }))
+    check response["result"]["completion"]["values"].len == 1
+    check response["result"]["completion"]["values"][0].getStr == "pydiscard"
+    check response["result"]["completion"]["total"].getInt == 1
+    check not response["result"]["completion"]["hasMore"].getBool
+
+    response = server.handleJson(modernRequest(62, "completion/complete", %*{
+      "ref": {"type": "ref/resource",
+               "uri": "demo:///{owner}/{name}"},
+      "argument": {"name": "owner", "value": "ac"},
+      "context": {"arguments": {"name": "report"}}
+    }))
+    check response["result"]["completion"]["values"][0].getStr == "ac-team"
+
+  test "rejects invalid completion references and arguments":
+    let server = newMcpServer("completion-validation", "1.0.0")
+    let handler: McpSyncPromptSingleHandler = proc (
+        arguments: McpPromptArguments,
+        ignoredContext: McpContext): McpPromptMessage = userText("ok")
+    server.addPrompt newMcpPrompt("review", handler,
+      arguments = @[newMcpPromptArgument("language")])
+    let base = %*{
+      "ref": {"type": "ref/prompt", "name": "review"},
+      "argument": {"name": "language", "value": "p"}
+    }
+    var response = server.handleJson(modernRequest(63,
+      "completion/complete", base))
+    check response["result"]["completion"]["values"].len == 0
+    var request = modernRequest(64, "completion/complete", %*{
+      "argument": {"name": "language", "value": "p"}
+    })
+    response = server.handleJson(request)
+    check response["error"]["code"].getInt == mcpInvalidParamsCode
+    request = modernRequest(65, "completion/complete", %*{
+      "ref": {"type": "ref/unknown", "name": "review"},
+      "argument": {"name": "language", "value": "p"}
+    })
+    response = server.handleJson(request)
+    check response["error"]["code"].getInt == mcpInvalidParamsCode
+    request = modernRequest(66, "completion/complete", %*{
+      "ref": {"type": "ref/prompt", "name": "missing"},
+      "argument": {"name": "language", "value": "p"}
+    })
+    response = server.handleJson(request)
+    check response["error"]["code"].getInt == mcpInvalidParamsCode
+    request = modernRequest(67, "completion/complete", %*{
+      "ref": {"type": "ref/prompt", "name": "review"},
+      "argument": {"name": "missing", "value": "p"}
+    })
+    response = server.handleJson(request)
+    check response["error"]["code"].getInt == mcpInvalidParamsCode
+    request = modernRequest(68, "completion/complete", %*{
+      "ref": {"type": "ref/prompt", "name": "review"},
+      "argument": {"name": "language", "value": "p"},
+      "context": {"arguments": {"language": 1}}
+    })
+    response = server.handleJson(request)
+    check response["error"]["code"].getInt == mcpInvalidParamsCode
+
+  test "bounds large completion result sets":
+    let server = newMcpServer("completion-limit", "1.0.0")
+    let handler: McpSyncPromptSingleHandler = proc (
+        arguments: McpPromptArguments,
+        ignoredContext: McpContext): McpPromptMessage = userText("ok")
+    server.addPrompt newMcpPrompt("large", handler,
+      arguments = @[newMcpPromptArgument("value")])
+    var suggestions = newSeq[string](mcpDefaultCompletionLimit + 7)
+    for index in 0 ..< suggestions.len:
+      suggestions[index] = "value-" & $index
+    let completion: McpSyncPromptCompletionHandler = proc (
+        argument, prefix: string,
+        ignoredContext: McpContext): seq[string] = suggestions
+    server.addPromptCompletion("large", "value", completion)
+    let response = server.handleJson(modernRequest(69, "completion/complete", %*{
+      "ref": {"type": "ref/prompt", "name": "large"},
+      "argument": {"name": "value", "value": "v"}
+    }))
+    check response["result"]["completion"]["values"].len ==
+      mcpDefaultCompletionLimit
+    check response["result"]["completion"]["values"][99].getStr == "value-99"
+    check response["result"]["completion"]["total"].getInt ==
+      mcpDefaultCompletionLimit + 7
+    check response["result"]["completion"]["hasMore"].getBool
+
+suite "nimwire subscriptions":
+  test "acknowledges filters, routes changes, and closes gracefully":
+    let server = newMcpServer("subscriptions", "1.0.0")
+    let toolHandler: McpSyncToolHandler = proc (
+        arguments: JsonNode,
+        ignoredContext: McpContext): McpToolResult = textResult("ok")
+    server.addTool newMcpTool("one", "One", %*{"type": "object"},
+      toolHandler)
+    let promptHandler: McpSyncPromptSingleHandler = proc (
+        arguments: McpPromptArguments,
+        ignoredContext: McpContext): McpPromptMessage = userText("ok")
+    server.addPrompt newMcpPrompt("one", promptHandler)
+    server.addResource newMcpResource("memo://one", "One",
+      resourceText("memo://one", "one"))
+    server.markToolsChanged()
+    server.markPromptsChanged()
+    server.markResourcesChanged()
+
+    var messages: seq[JsonNode]
+    let handler: McpSubscriptionMessageHandler = proc (message: JsonNode) =
+      messages.add message
+    let request = modernRequest(70, "subscriptions/listen", %*{
+      "notifications": {
+        "toolsListChanged": true,
+        "promptsListChanged": true,
+        "resourcesListChanged": true,
+        "resourceSubscriptions": ["memo://one"]
+      }
+    })
+    let message = parseMcpMessage(request)
+    let context = newMcpContext(message.request)
+    let output = waitFor server.handleMessageAsync(message, context, handler)
+    check output.isNone
+    check messages.len == 1
+    check messages[0]["method"].getStr ==
+      "notifications/subscriptions/acknowledged"
+    check messages[0]["params"]["notifications"]["toolsListChanged"].getBool
+    check messages[0]["params"]["notifications"][
+      "resourceSubscriptions"][0].getStr == "memo://one"
+
+    server.markToolsChanged()
+    server.markPromptsChanged()
+    server.markResourcesChanged()
+    server.markResourceUpdated("memo://one")
+    check messages.len == 5
+    check messages[1]["method"].getStr ==
+      "notifications/tools/list_changed"
+    check messages[2]["method"].getStr ==
+      "notifications/prompts/list_changed"
+    check messages[3]["method"].getStr ==
+      "notifications/resources/list_changed"
+    check messages[4]["method"].getStr ==
+      "notifications/resources/updated"
+    check messages[4]["params"]["uri"].getStr == "memo://one"
+    check messages[4]["params"]["_meta"][
+      "io.modelcontextprotocol/subscriptionId"].getInt == 70
+
+    check server.subscriptionCount == 1
+    check server.closeSubscriptions() == 1
+    check server.subscriptionCount == 0
+    check messages.len == 6
+    check messages[5]["id"].getInt == 70
+    check messages[5]["result"]["resultType"].getStr == "complete"
+    check messages[5]["result"]["_meta"][
+      "io.modelcontextprotocol/subscriptionId"].getInt == 70
+
+  test "honors opt-in filters and cancellation":
+    let server = newMcpServer("subscription-filter", "1.0.0")
+    let toolHandler: McpSyncToolHandler = proc (
+        arguments: JsonNode,
+        ignoredContext: McpContext): McpToolResult = textResult("ok")
+    server.addTool newMcpTool("one", "One", %*{"type": "object"},
+      toolHandler)
+    server.markToolsChanged()
+    var messages: seq[JsonNode]
+    let handler: McpSubscriptionMessageHandler = proc (message: JsonNode) =
+      messages.add message
+    let listen = parseMcpMessage(modernRequest(71, "subscriptions/listen", %*{
+      "notifications": {"toolsListChanged": true}
+    }))
+    discard waitFor server.handleMessageAsync(listen,
+      newMcpContext(listen.request), handler)
+    check messages.len == 1
+    server.markPromptsChanged()
+    check messages.len == 1
+    server.markToolsChanged()
+    check messages.len == 2
+    var cancel = modernRequest(72, "notifications/cancelled", %*{
+      "requestId": 71
+    })
+    cancel.delete("id")
+    let cancelMessage = parseMcpMessage(cancel)
+    let cancelOutput = waitFor server.handleMessageAsync(cancelMessage,
+      newMcpContext(cancelMessage.request))
+    check cancelOutput.isNone
+    check server.subscriptionCount == 0
+    server.markToolsChanged()
+    check messages.len == 2
+
+  test "supports an explicit publisher backend":
+    var published: seq[McpSubscriptionEventKind]
+    let publisher: McpEventPublisher = proc (event: McpSubscriptionEvent) =
+      published.add event.kind
+    let bus = newMcpEventBus(publisher)
+    let server = newMcpServer("publisher", "1.0.0", eventBus = bus)
+    server.markToolsChanged()
+    server.markPromptsChanged()
+    check published == @[mcpToolsListChanged, mcpPromptsListChanged]
+
+suite "nimwire multi round-trip requests":
+  test "retries input_required tools with responses and opaque state":
+    let server = newMcpServer("mrtr", "1.0.0")
+    server.addTool newMcpTool("profile", "Build a profile", %*{
+      "type": "object"
+    }, proc (arguments: JsonNode,
+            context: McpContext): McpToolResult =
+      if context.inputResponses.len == 0:
+        context.requireInput(newMcpInputRequiredResult(@[
+          ("name", newMcpElicitationFormRequest("What is your name?", %*{
+            "type": "object",
+            "properties": {"name": {"type": "string", "minLength": 2}},
+            "required": ["name"]
+          }))
+        ], "opaque-state-v1"))
+      else:
+        check context.inputResponse("name")["action"].getStr == "accept"
+        check context.requestState == "opaque-state-v1"
+        check context.inputResponse("name")["content"]["name"].getStr == "Ada"
+      textResult("done"))
+
+    let original = parseMcpMessage(modernRequest(100, "tools/call", %*{
+      "name": "profile", "arguments": {}
+    }))
+    let firstResponse = parseMcpMessage(server.handleJson(
+      modernRequest(100, "tools/call", %*{
+        "name": "profile", "arguments": {}
+      })))
+    check firstResponse.response.result.resultType == mcpInputRequired
+    check firstResponse.response.result.fields["requestState"].getStr ==
+      "opaque-state-v1"
+
+    let client = newMcpInputClient(firstRequestId = 101,
+      elicitationHandler = proc (
+          request: McpElicitationRequest): McpElicitationResult =
+        acceptElicitation(%*{"name": "Ada"}))
+    let retry = client.retryInputRequired(original, firstResponse)
+    check retry.request.id.integerValue != original.request.id.integerValue
+    check retry.request.params.values["requestState"].getStr ==
+      firstResponse.response.result.fields["requestState"].getStr
+    let finalResponse = server.handleJson(toJson(retry))
+    check finalResponse["id"].getInt == retry.request.id.integerValue
+    check finalResponse["result"]["resultType"].getStr == "complete"
+    check finalResponse["result"]["content"][0]["text"].getStr == "done"
+
+  test "handles elicitation, sampling, and roots input requests":
+    let result = newMcpInputRequiredResult(@[
+      ("ask", newMcpElicitationFormRequest("Name", %*{
+        "type": "object", "properties": {"name": {"type": "string"}},
+        "required": ["name"]
+      })),
+      ("sample", newMcpInputRequest("sampling/createMessage", %*{
+        "messages": []
+      })),
+      ("roots", newMcpInputRequest("roots/list"))
+    ], "opaque")
+    let original = parseMcpMessage(modernRequest(110, "tools/call", %*{
+      "name": "unused", "arguments": {}
+    }))
+    let response = successResponse(original.request.id, result)
+    let client = newMcpInputClient(firstRequestId = 111,
+      elicitationHandler = proc (
+          request: McpElicitationRequest): McpElicitationResult =
+        acceptElicitation(%*{"name": "Ada"}),
+      samplingHandler = proc (request: McpInputRequest): JsonNode =
+        %*{"role": "assistant", "content": {"type": "text", "text": "ok"}},
+      rootsHandler = proc (request: McpInputRequest): JsonNode =
+        %*{"roots": []})
+    let retry = client.retryInputRequired(original,
+      parseMcpMessage(toJson(response)), client.freshRequestId())
+    check retry.request.params.values["inputResponses"]["ask"][
+      "content"]["name"].getStr == "Ada"
+    check retry.request.params.values["inputResponses"]["sample"][
+      "role"].getStr == "assistant"
+    check retry.request.params.values["inputResponses"]["roots"][
+      "roots"].kind == JArray
+
+  test "rejects invalid accepted form content and reused retry ids":
+    let result = newMcpInputRequiredResult(@[
+      ("ask", newMcpElicitationFormRequest("Name", %*{
+        "type": "object", "properties": {"name": {"type": "string"}},
+        "required": ["name"]
+      }))
+    ])
+    let original = parseMcpMessage(modernRequest(120, "tools/call", %*{
+      "name": "unused", "arguments": {}
+    }))
+    let response = parseMcpMessage(toJson(
+      successResponse(original.request.id, result)))
+    let badClient = newMcpInputClient(firstRequestId = 121,
+      elicitationHandler = proc (
+          request: McpElicitationRequest): McpElicitationResult =
+        acceptElicitation(%*{"name": 7}))
+    expect McpError:
+      discard badClient.retryInputRequired(original, response,
+        badClient.freshRequestId())
+
+    let client = newMcpInputClient(firstRequestId = 122)
+    expect McpError:
+      discard client.retryInputRequired(original, response, original.request.id)
+
+  test "binds verified request state to the request context":
+    var sealed = false
+    var verified = false
+    let sealer: McpRequestStateSealer = proc (
+        payload: JsonNode, context: McpContext): string =
+      sealed = true
+      "sealed:" & payload["step"].getStr
+    let verifier: McpRequestStateVerifier = proc (
+        state: string, context: McpContext): JsonNode =
+      verified = state == "sealed:1" and context.principal.subject == "user"
+      if verified: %*{"step": "1"} else: nil
+    let server = newMcpServer("state", "1.0.0",
+      requestStateSealer = sealer, requestStateVerifier = verifier)
+    server.addTool newMcpTool("stateful", "Stateful", %*{"type": "object"},
+      proc (arguments: JsonNode, context: McpContext): McpToolResult =
+        if context.inputResponses.len == 0:
+          context.requireInput(newMcpInputRequiredResult(nil,
+            context.sealRequestState(%*{"step": "1"})))
+        else:
+          check context.requestStatePayload["step"].getStr == "1"
+        textResult("ok"))
+    let principal = newMcpPrincipal("user")
+    let request = modernRequest(130, "tools/call", %*{
+      "name": "stateful", "arguments": {}
+    })
+    let first = parseMcpMessage(request)
+    let firstContext = newMcpContext(first.request, principal = principal)
+    let firstOutput = waitFor server.handleMessageAsync(first, firstContext)
+    check firstOutput.get.response.result.fields["requestState"].getStr ==
+      "sealed:1"
+    check sealed
+    let retryRequest = modernRequest(131, "tools/call", %*{
+      "name": "stateful", "arguments": {},
+      "inputResponses": {"done": {"action": "accept"}},
+      "requestState": "sealed:1"
+    })
+    let retryMessage = parseMcpMessage(retryRequest)
+    let retryContext = newMcpContext(retryMessage.request,
+      principal = principal)
+    let retryOutput = waitFor server.handleMessageAsync(retryMessage,
+      retryContext)
+    check retryOutput.get.response.result.resultType == mcpComplete
+    check verified

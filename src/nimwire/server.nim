@@ -7,6 +7,7 @@ import ./context
 import ./prompts
 import ./resources
 import ./schema
+import ./subscriptions
 
 type
   McpToolHandler* = proc (arguments: JsonNode,
@@ -48,10 +49,16 @@ type
     resourceSubscriptions: seq[McpResourceSubscription]
     promptsListChanged: bool
     prompts: seq[McpPrompt]
+    eventBus: McpEventBus
+    subscriptions: seq[McpSubscription]
+    requestStateSealer: McpRequestStateSealer
+    requestStateVerifier: McpRequestStateVerifier
 
 proc newMcpServer*(name, version: string, instructions = "",
                    listTtlMs = 0, listCacheScope = "private",
-                   listPageSize = 0): McpServer =
+                   listPageSize = 0, eventBus: McpEventBus = nil,
+                   requestStateSealer: McpRequestStateSealer = nil,
+                   requestStateVerifier: McpRequestStateVerifier = nil): McpServer =
   if name.len == 0: raise newMcpError("server name must not be empty")
   if version.len == 0: raise newMcpError("server version must not be empty")
   if listTtlMs < 0: raise newMcpError("listTtlMs must be at least 0")
@@ -60,7 +67,14 @@ proc newMcpServer*(name, version: string, instructions = "",
   if listPageSize < 0: raise newMcpError("listPageSize must be at least 0")
   McpServer(name: name, version: version, instructions: instructions,
     listTtlMs: listTtlMs, listCacheScope: listCacheScope,
-    listPageSize: listPageSize)
+    listPageSize: listPageSize,
+    eventBus: if eventBus.isNil: newMcpEventBus() else: eventBus,
+    requestStateSealer: requestStateSealer,
+    requestStateVerifier: requestStateVerifier)
+
+proc resultObject(server: McpServer): McpResult
+proc closeSubscription*(server: McpServer, subscription: McpSubscription,
+                        graceful = true): bool
 
 proc validateToolDefinition(name, description: string, inputSchema,
                             outputSchema, icons, annotations: JsonNode):
@@ -173,11 +187,13 @@ proc unsubscribeResources*(server: McpServer,
 proc markResourcesChanged*(server: McpServer) =
   if server.isNil: raise newMcpError("server must not be nil")
   server.resourcesListChanged = true
+  server.eventBus.publishResourcesChanged()
   server.emitResourceListChanged()
 
 proc markResourceUpdated*(server: McpServer, uri: string) =
   if server.isNil: raise newMcpError("server must not be nil")
   validateResourceUri(uri, "resource")
+  server.eventBus.publishResourceUpdated(uri)
   server.emitResourceUpdated(uri)
 
 proc notifyResourceListChanged*(server: McpServer) =
@@ -199,6 +215,7 @@ proc addResource*(server: McpServer, resource: McpResource) =
     if current.uri == resource.uri:
       raise newMcpError("duplicate resource URI: " & resource.uri)
   server.resources.add resource
+  server.resourcesSubscribe = true
 
 proc addResourceTemplate*(server: McpServer,
                           resourceTemplate: McpResourceTemplate) =
@@ -211,6 +228,7 @@ proc addResourceTemplate*(server: McpServer,
       raise newMcpError("duplicate resource URI template: " &
         resourceTemplate.uriTemplate)
   server.resourceTemplates.add resourceTemplate
+  server.resourcesSubscribe = true
 
 proc addResourceTemplateCompletion*(server: McpServer, uriTemplate,
                                     argument: string,
@@ -256,6 +274,115 @@ proc findPrompt*(server: McpServer, name: string): int =
     if prompt.name == name: return index
   -1
 
+proc optionalBool(value: JsonNode, key, label: string): bool =
+  if key notin value: return false
+  if value[key].kind != JBool:
+    raise newMcpError(label & " '" & key & "' must be a boolean")
+  value[key].getBool
+
+proc parseSubscriptionFilter*(value: JsonNode): McpSubscriptionFilter =
+  let notifications = requireObject(value, "subscriptions/listen notifications")
+  result.toolsListChanged = optionalBool(notifications, "toolsListChanged",
+    "subscription notification")
+  result.promptsListChanged = optionalBool(notifications, "promptsListChanged",
+    "subscription notification")
+  result.resourcesListChanged = optionalBool(notifications,
+    "resourcesListChanged", "subscription notification")
+  if "resourceSubscriptions" in notifications:
+    if notifications["resourceSubscriptions"].kind != JArray:
+      raise newMcpError("subscription notification 'resourceSubscriptions' must be an array")
+    for value in notifications["resourceSubscriptions"].items:
+      if value.kind != JString or value.getStr.len == 0:
+        raise newMcpError("resource subscription URIs must be non-empty strings")
+      validateResourceUri(value.getStr, "resource subscription")
+      if value.getStr notin result.resourceSubscriptions:
+        result.resourceSubscriptions.add value.getStr
+
+proc acknowledgedFilter(server: McpServer,
+                        requested: McpSubscriptionFilter): McpSubscriptionFilter =
+  result.toolsListChanged = requested.toolsListChanged and
+    server.toolsListChanged
+  result.promptsListChanged = requested.promptsListChanged and
+    server.promptsListChanged
+  result.resourcesListChanged = requested.resourcesListChanged and
+    server.resourcesListChanged
+  if server.resourcesSubscribe:
+    result.resourceSubscriptions = requested.resourceSubscriptions
+
+proc subscriptionFilterJson(filter: McpSubscriptionFilter): JsonNode =
+  result = newJObject()
+  if filter.toolsListChanged: result["toolsListChanged"] = %true
+  if filter.promptsListChanged: result["promptsListChanged"] = %true
+  if filter.resourcesListChanged: result["resourcesListChanged"] = %true
+  if filter.resourceSubscriptions.len > 0:
+    result["resourceSubscriptions"] = newJArray()
+    for uri in filter.resourceSubscriptions:
+      result["resourceSubscriptions"].add %uri
+
+proc acknowledgedNotification(id: McpId,
+                              filter: McpSubscriptionFilter): JsonNode =
+  var params = newJObject()
+  params["_meta"] = newJObject()
+  params["_meta"]["io.modelcontextprotocol/subscriptionId"] = toJson(id)
+  params["notifications"] = subscriptionFilterJson(filter)
+  %*{"jsonrpc": mcpJsonRpcVersion,
+    "method": "notifications/subscriptions/acknowledged",
+    "params": params}
+
+proc openSubscription*(server: McpServer, id: McpId,
+                       requested: McpSubscriptionFilter,
+                       handler: McpSubscriptionMessageHandler):
+                       McpSubscription =
+  if server.isNil: raise newMcpError("server must not be nil")
+  let filter = server.acknowledgedFilter(requested)
+  result = server.eventBus.subscribe(id, filter, handler)
+  server.subscriptions.add result
+  result.setCloseHandler(proc (subscription: McpSubscription, graceful: bool) =
+    discard server.closeSubscription(subscription, graceful))
+  result.deliver(acknowledgedNotification(id, filter))
+  result.activate()
+
+proc subscriptionCount*(server: McpServer): int =
+  if server.isNil: return 0
+  for subscription in server.subscriptions:
+    if subscription.isActive: inc result
+
+proc findSubscription*(server: McpServer, id: McpId): McpSubscription =
+  if server.isNil: return nil
+  for subscription in server.subscriptions:
+    if subscription.isActive and $toJson(subscription.id) == $toJson(id):
+      return subscription
+
+proc closeSubscription*(server: McpServer, subscription: McpSubscription,
+                        graceful: bool): bool =
+  if server.isNil or subscription.isNil or not subscription.isActive:
+    return false
+  if graceful:
+    var fields = resultObject(server).fields
+    fields["_meta"]["io.modelcontextprotocol/subscriptionId"] =
+      toJson(subscription.id)
+    subscription.deliver(toJson(successResponse(subscription.id,
+      newMcpResult(mcpComplete, fields))))
+  discard server.eventBus.unsubscribe(subscription)
+  for index in countdown(server.subscriptions.high, 0):
+    if server.subscriptions[index] == subscription:
+      server.subscriptions.delete(index)
+      break
+  true
+
+proc closeSubscriptions*(server: McpServer, graceful = true): int =
+  if server.isNil: return 0
+  let subscriptions = server.subscriptions
+  for subscription in subscriptions:
+    if server.closeSubscription(subscription, graceful): inc result
+
+proc cancelSubscription*(server: McpServer, id: McpId): bool =
+  if server.isNil: return false
+  for subscription in server.subscriptions:
+    if $toJson(subscription.id) == $toJson(id):
+      return server.closeSubscription(subscription, graceful = false)
+  false
+
 proc addPromptCompletion*(server: McpServer, promptName, argument: string,
                           handler: McpPromptCompletionHandler) =
   if server.isNil: raise newMcpError("server must not be nil")
@@ -283,6 +410,7 @@ proc completePromptArgument*(server: McpServer, promptName, argument, prefix: st
 proc markPromptsChanged*(server: McpServer) =
   if server.isNil: raise newMcpError("server must not be nil")
   server.promptsListChanged = true
+  server.eventBus.publishPromptsChanged()
 
 proc completeResourceTemplate*(server: McpServer, uriTemplate, argument,
                                prefix: string,
@@ -297,6 +425,7 @@ proc completeResourceTemplate*(server: McpServer, uriTemplate, argument,
 proc markToolsChanged*(server: McpServer) =
   if server.isNil: raise newMcpError("server must not be nil")
   server.toolsListChanged = true
+  server.eventBus.publishToolsChanged()
 
 proc serverMeta(server: McpServer): JsonNode =
   %*{"io.modelcontextprotocol/serverInfo": {
@@ -481,6 +610,8 @@ proc discover(server: McpServer): McpResult =
     fields["capabilities"]["prompts"] = %*{
       "listChanged": server.promptsListChanged
     }
+  if server.prompts.len > 0 or server.resourceTemplates.len > 0:
+    fields["capabilities"]["completions"] = %*{}
   if server.instructions.len > 0:
     fields["instructions"] = %server.instructions
   newMcpResult(mcpComplete, fields)
@@ -512,6 +643,8 @@ proc callTool(server: McpServer, params: McpParams,
     "tool '" & name & "' arguments")
   let output = await server.tools[index].handler(arguments, context)
   context.checkCancelled()
+  if context.hasInputRequired:
+    return context.inputRequired
   if not output.structuredContent.isNil and
       not server.tools[index].outputSchema.isNil:
     try:
@@ -560,6 +693,8 @@ proc readResourceRequest(server: McpServer, params: McpParams,
     if not matched:
       raise newMcpError("Resource not found", mcpInvalidParamsCode,
         %*{"uri": uri})
+  if context.hasInputRequired:
+    return context.inputRequired
   var fields = resultObject(server).fields
   fields["contents"] = newJArray()
   for content in contents:
@@ -583,6 +718,8 @@ proc getPromptRequest(server: McpServer, params: McpParams,
   context.checkCancelled()
   let messages = await prompt.runPrompt(arguments, context)
   context.checkCancelled()
+  if context.hasInputRequired:
+    return context.inputRequired
   var fields = resultObject(server).fields
   if prompt.description.len > 0:
     fields["description"] = %prompt.description
@@ -590,6 +727,112 @@ proc getPromptRequest(server: McpServer, params: McpParams,
   for message in messages:
     fields["messages"].add toJson(message)
   newMcpResult(mcpComplete, fields)
+
+proc completionArguments(value: JsonNode, label: string): JsonNode =
+  if value.isNil or value.kind != JObject:
+    raise newMcpError(label & " must be an object")
+  for name, argument in value.pairs:
+    if argument.kind != JString:
+      raise newMcpError(label & " argument '" & name & "' must be a string")
+  value
+
+proc completionResult(server: McpServer, values: seq[string]): McpResult =
+  var completion = %*{
+    "values": newJArray(),
+    "total": values.len,
+    "hasMore": values.len > mcpDefaultCompletionLimit
+  }
+  let visible = min(values.len, mcpDefaultCompletionLimit)
+  for index in 0 ..< visible:
+    completion["values"].add %values[index]
+  var fields = resultObject(server).fields
+  fields["completion"] = completion
+  newMcpResult(mcpComplete, fields)
+
+proc completeRequest(server: McpServer, params: McpParams,
+                     context: McpContext): Future[McpResult] {.async.} =
+  if "ref" notin params.values:
+    raise newMcpError("completion/complete requires 'ref'")
+  if "argument" notin params.values:
+    raise newMcpError("completion/complete requires 'argument'")
+  let reference = requireObject(params.values["ref"],
+    "completion/complete ref")
+  let referenceType = requiredString(reference, "type",
+    "completion/complete ref")
+  let argument = requireObject(params.values["argument"],
+    "completion/complete argument")
+  let argumentName = requiredString(argument, "name",
+    "completion/complete argument")
+  if "value" notin argument or argument["value"].kind != JString:
+    raise newMcpError("completion/complete argument requires a string 'value'")
+  let prefix = argument["value"].getStr
+  let priorArguments = if "context" in params.values:
+    let requestContext = requireObject(params.values["context"],
+      "completion/complete context")
+    if "arguments" in requestContext:
+      completionArguments(requestContext["arguments"],
+        "completion/complete context arguments")
+    else:
+      newJObject()
+  else:
+    newJObject()
+  context.completionArguments = priorArguments
+  case referenceType
+  of "ref/prompt":
+    let name = requiredString(reference, "name", "completion prompt ref")
+    let index = server.findPrompt(name)
+    if index < 0:
+      raise newMcpError("unknown prompt: " & name)
+    let prompt = server.prompts[index]
+    for priorName in priorArguments.keys:
+      var known = false
+      for promptArgument in prompt.arguments:
+        if promptArgument.name == priorName:
+          known = true
+          break
+      if not known:
+        raise newMcpError("unknown prompt argument: " & priorName)
+    let values = await server.completePromptArgument(name, argumentName,
+      prefix, context)
+    server.completionResult(values)
+  of "ref/resource":
+    let uri = requiredString(reference, "uri", "completion resource ref")
+    var index = server.findResourceTemplate(uri)
+    if index < 0:
+      for candidate in 0 ..< server.resourceTemplates.len:
+        if not server.resourceTemplates[candidate].matchResourceTemplate(uri).isNil:
+          index = candidate
+          break
+    if index < 0:
+      raise newMcpError("unknown resource template: " & uri)
+    let resourceTemplate = server.resourceTemplates[index]
+    let templateArguments = resourceTemplateVariables(resourceTemplate.uriTemplate)
+    if argumentName notin templateArguments:
+      raise newMcpError("unknown resource template argument: " & argumentName)
+    for priorName in priorArguments.keys:
+      if priorName notin templateArguments:
+        raise newMcpError("unknown resource template argument: " & priorName)
+    let values = await server.completeResourceTemplate(
+      resourceTemplate.uriTemplate, argumentName, prefix, context)
+    server.completionResult(values)
+  else:
+    raise newMcpError("unsupported completion reference type: " & referenceType)
+
+proc prepareContext(server: McpServer, context: McpContext) =
+  if context.isNil: return
+  if not server.requestStateSealer.isNil:
+    context.requestStateSealer = server.requestStateSealer
+  if not server.requestStateVerifier.isNil:
+    context.requestStateVerifier = server.requestStateVerifier
+
+proc validateRoundTripRequest(server: McpServer, request: McpRpcRequest,
+                              context: McpContext) =
+  if "inputResponses" notin request.params.values and
+      "requestState" notin request.params.values:
+    return
+  if request.methodName notin ["tools/call", "prompts/get", "resources/read"]:
+    raise newMcpError("inputResponses and requestState are only valid on tools/call, prompts/get, or resources/read")
+  discard context.verifyRequestState()
 
 proc dispatchAsync*(server: McpServer, request: McpRpcRequest,
                     context: McpContext): Future[McpResult] {.async.} =
@@ -613,17 +856,49 @@ proc dispatchAsync*(server: McpServer, request: McpRpcRequest,
     result = server.listPrompts(request.params)
   of "prompts/get":
     result = await server.getPromptRequest(request.params, context)
+  of "completion/complete":
+    result = await server.completeRequest(request.params, context)
   else:
     raise newMcpError("Method not found: " & request.methodName,
       mcpMethodNotFoundCode)
 
 proc handleMessageAsync*(server: McpServer, message: McpJsonRpcMessage,
-                         context: McpContext):
+                         context: McpContext,
+                         subscriptionHandler: McpSubscriptionMessageHandler = nil):
                          Future[Option[McpJsonRpcMessage]] {.async.} =
   case message.kind
   of mcpRequestMessage, mcpNotificationMessage:
     let request = message.request
     try:
+      server.prepareContext(context)
+      server.validateRoundTripRequest(request, context)
+      if request.methodName == "subscriptions/listen":
+        if request.kind != mcpRequest:
+          raise newMcpError("subscriptions/listen requires a request id",
+            mcpInvalidRequestCode)
+        if "notifications" notin request.params.values:
+          raise newMcpError("subscriptions/listen requires 'notifications'")
+        let filter = parseSubscriptionFilter(
+          request.params.values["notifications"])
+        if subscriptionHandler.isNil:
+          var acknowledgment: JsonNode
+          let capture: McpSubscriptionMessageHandler =
+            proc (message: JsonNode) =
+              if acknowledgment.isNil: acknowledgment = message
+          let subscription = server.openSubscription(request.id, filter, capture)
+          let message = parseMcpMessage(acknowledgment)
+          discard server.closeSubscription(subscription, graceful = false)
+          return some(message)
+        discard server.openSubscription(request.id, filter, subscriptionHandler)
+        return none(McpJsonRpcMessage)
+      if request.methodName == "notifications/cancelled":
+        if "requestId" in request.params.values:
+          try:
+            let subscriptionId = parseMcpId(request.params.values["requestId"])
+            discard server.cancelSubscription(subscriptionId)
+          except CatchableError:
+            discard
+        return none(McpJsonRpcMessage)
       let value = await server.dispatchAsync(request, context)
       if request.kind == mcpNotification:
         return none(McpJsonRpcMessage)
