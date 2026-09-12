@@ -1,0 +1,7 @@
+nimcache/
+tests/all_tests
+examples/*
+!examples/*.nim
+*.dSYM/
+.DS_Store
+nimwire_todo.md
