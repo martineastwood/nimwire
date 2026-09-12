@@ -1375,3 +1375,100 @@ suite "nimwire authorization":
       "name": "one", "arguments": {}
     }))
     check response["error"]["code"].getInt == mcpInvalidParamsCode
+
+suite "nimwire observability":
+  test "emits structured request events and independent spans":
+    let server = newMcpServer("observed", "1.0.0")
+    var logs: seq[McpRequestEvent]
+    var metricEvents: seq[McpRequestEvent]
+    var spansStarted = 0
+    var spansEnded = 0
+    let requestLog: McpRequestLogHook = proc (event: McpRequestEvent) =
+      logs.add event
+    let metrics: McpMetricsHook = proc (event: McpRequestEvent) =
+      metricEvents.add event
+    let spanStart: McpSpanStartHook = proc (
+        event: McpRequestEvent): McpSpanHandle =
+      inc spansStarted
+      McpSpanHandle(state: %*{"correlationId": event.correlationId})
+    let spanEnd: McpSpanEndHook = proc (span: McpSpanHandle,
+                                        event: McpRequestEvent) =
+      inc spansEnded
+      check span.state["correlationId"].getStr == event.correlationId
+    let hooks = McpObservability(requestLog: requestLog, metrics: metrics,
+      spanStart: spanStart, spanEnd: spanEnd)
+    server.setObservability(hooks)
+
+    var request = modernRequest(170, "ping")
+    request["params"]["_meta"][mcpMetaTraceContextKey] = %*{
+      "traceparent": "00-abc-def-01",
+      "tracestate": "vendor=value",
+      "baggage": "tenant=demo"
+    }
+    request["params"]["_meta"][mcpMetaLogLevelKey] = %"warning"
+    let response = server.handleJson(request)
+    check response["result"]["resultType"].getStr == "complete"
+    check logs.len == 1
+    check metricEvents.len == 1
+    check spansStarted == 1
+    check spansEnded == 1
+    let event = logs[0]
+    check event.requestId.integerValue == 170
+    check event.correlationId.len > 0
+    check event.correlationId != "170"
+    check event.methodName == "ping"
+    check event.transport.kind == mcpTransportUnknown
+    check event.hasTraceContext
+    check event.traceContext.traceparent == "00-abc-def-01"
+    check event.traceContext.tracestate == "vendor=value"
+    check event.traceContext.baggage == "tenant=demo"
+    check event.hasLogLevel and event.logLevel == mcpLogWarning
+    check event.durationMs >= 0
+    check event.requestBytes == ($request).len
+    check event.responseBytes > 0
+    check event.hasResultType and event.resultType == mcpComplete
+    check event.errorCode == 0
+    check not event.cancelled
+    check event.activeSubscriptions == 0
+    let encoded = toJson(event)
+    check encoded["correlationId"].getStr == event.correlationId
+    check encoded["requestId"].getInt == 170
+    check encoded["transport"].getStr == "unknown"
+    check encoded["traceContext"]["baggage"].getStr == "tenant=demo"
+    check encoded["logLevel"].getStr == "warning"
+    check encoded["resultType"].getStr == "complete"
+
+  test "treats request logLevel as the logger minimum":
+    var request = modernRequest(172, "ping")
+    request["params"]["_meta"][mcpMetaLogLevelKey] = %"warning"
+    let parsed = parseMcpMessage(request)
+    var levels: seq[McpLogLevel]
+    let logger: McpLogger = proc (level: McpLogLevel, message: string) =
+      levels.add level
+    let context = newMcpContext(parsed.request, logger = logger)
+    context.log(mcpLogInfo, "hidden")
+    context.log(mcpLogWarning, "shown")
+    context.log(mcpLogError, "shown")
+    check levels == @[mcpLogWarning, mcpLogError]
+
+  test "records cancellation and protocol error codes":
+    let server = newMcpServer("observed-cancel", "1.0.0")
+    var events: seq[McpRequestEvent]
+    server.setObservability(McpObservability(
+      metrics: proc (event: McpRequestEvent) = events.add event))
+    server.addTool newMcpTool("slow", "Slow", %*{"type": "object"},
+      proc (args: JsonNode, context: McpContext): Future[McpToolResult] {.async.} =
+        await sleepAsync(20)
+        context.checkCancelled()
+        textResult("done"))
+    let message = parseMcpMessage(modernRequest(173, "tools/call", %*{
+      "name": "slow", "arguments": {}
+    }))
+    let context = newMcpContext(message.request)
+    let pending = server.handleMessageAsync(message, context)
+    waitFor sleepAsync(1)
+    check server.cancelRequest(message.request.id, "client left")
+    discard waitFor pending
+    check events.len == 1
+    check events[0].cancelled
+    check events[0].errorCode == mcpRequestCancelledCode

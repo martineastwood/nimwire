@@ -49,6 +49,8 @@ type
   McpContext* = ref object
     ## This object is created once per request and must not be shared.
     requestId*: McpId
+    correlationId*: string
+    requestBytes*: int
     methodName*: string
     metadata*: McpRequestMeta
     cancellation*: McpCancellation
@@ -124,6 +126,9 @@ proc randomStateHandle(store: McpStateStore): string =
     result = "nimwire." & encode(urandom(32), safe = true)
     if result notin store.entries: return
 
+proc newMcpCorrelationId*(): string =
+  "nimwire.correlation." & encode(urandom(16), safe = true)
+
 proc mintStateHandle*(store: McpStateStore, subject: string,
                       value: JsonNode): string =
   if store.isNil: raise newMcpError("state store must not be nil")
@@ -163,11 +168,15 @@ proc newMcpContext*(request: McpRpcRequest,
                     requestStateSealer: McpRequestStateSealer = nil,
                     requestStateVerifier: McpRequestStateVerifier = nil,
                     notificationSender: McpNotificationSender = nil,
-                    deadlineMs = 0): McpContext =
+                    deadlineMs = 0, requestBytes = 0,
+                    correlationId = ""): McpContext =
   let hasProgressToken = request.params.meta.hasProgressToken
   McpContext(
     requestId: if request.kind == mcpRequest: request.id else:
       McpId(kind: mcpNullId),
+    correlationId: if correlationId.len > 0: correlationId else:
+      newMcpCorrelationId(),
+    requestBytes: max(0, requestBytes),
     methodName: request.methodName,
     metadata: request.params.meta,
     cancellation: if cancellation.isNil: newMcpCancellation() else: cancellation,
@@ -240,7 +249,9 @@ proc inputResponse*(context: McpContext, key: string): JsonNode =
   context.inputResponses[key]
 
 proc log*(context: McpContext, level: McpLogLevel, message: string) =
-  if not context.isNil and not context.logger.isNil:
+  let minimum = if context.isNil or not context.metadata.hasLogLevel:
+    mcpLogInfo else: context.metadata.logLevel
+  if not context.isNil and level >= minimum and not context.logger.isNil:
     context.logger(level, message)
 
 proc reportProgress*(context: McpContext, progress: float, total = -1.0,

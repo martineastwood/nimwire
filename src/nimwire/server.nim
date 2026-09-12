@@ -9,6 +9,7 @@ import ./prompts
 import ./resources
 import ./schema
 import ./security
+import ./observability
 import ./subscriptions
 
 type
@@ -65,6 +66,7 @@ type
     resourceFilter: McpResourceFilter
     promptFilter: McpPromptFilter
     securityLimits: McpSecurityLimits
+    observability: McpObservability
 
 proc newMcpServer*(name, version: string, instructions = "",
                    listTtlMs = 0, listCacheScope = "private",
@@ -693,6 +695,10 @@ proc setSecurityLimits*(server: McpServer, limits: McpSecurityLimits) =
     raise newMcpError("existing tool count exceeds the configured limit")
   server.securityLimits = limits
 
+proc setObservability*(server: McpServer, hooks: McpObservability) =
+  if server.isNil: raise newMcpError("server must not be nil")
+  server.observability = hooks
+
 proc visibleTool(server: McpServer, name: string,
                  principal: McpPrincipal): bool =
   server.toolFilter.isNil or server.toolFilter(name, principal)
@@ -1006,6 +1012,26 @@ proc dispatchAsync*(server: McpServer, request: McpRpcRequest,
   validateJsonSize(result.fields, server.securityLimits.maxContentBytes,
     "MCP result content")
 
+proc emitRequestEvent(server: McpServer, event: var McpRequestEvent,
+                      startedAt: float, span: McpSpanHandle) =
+  event.durationMs = max(0.0, (epochTime() - startedAt) * 1000.0)
+  event.activeSubscriptions = server.subscriptionCount
+  if not server.observability.requestLog.isNil:
+    try:
+      server.observability.requestLog(event)
+    except CatchableError:
+      discard
+  if not server.observability.metrics.isNil:
+    try:
+      server.observability.metrics(event)
+    except CatchableError:
+      discard
+  if not span.isNil and not server.observability.spanEnd.isNil:
+    try:
+      server.observability.spanEnd(span, event)
+    except CatchableError:
+      discard
+
 proc handleMessageAsync*(server: McpServer, message: McpJsonRpcMessage,
                          context: McpContext,
                          subscriptionHandler: McpSubscriptionMessageHandler = nil):
@@ -1013,7 +1039,19 @@ proc handleMessageAsync*(server: McpServer, message: McpJsonRpcMessage,
   case message.kind
   of mcpRequestMessage, mcpNotificationMessage:
     let request = message.request
+    var event = newMcpRequestEvent(context, request.methodName,
+      if request.kind == mcpRequest: request.id else: McpId(kind: mcpNullId))
+    let startedAt = epochTime()
+    var span: McpSpanHandle
+    if not server.observability.spanStart.isNil:
+      try:
+        span = server.observability.spanStart(event)
+      except CatchableError:
+        discard
     var tracked = false
+    defer:
+      event.cancelled = context.isCancelled
+      server.emitRequestEvent(event, startedAt, span)
     try:
       server.prepareContext(context)
       server.validateRoundTripRequest(request, context)
@@ -1033,6 +1071,9 @@ proc handleMessageAsync*(server: McpServer, message: McpJsonRpcMessage,
           let subscription = server.openSubscription(request.id, filter, capture)
           let message = parseMcpMessage(acknowledgment)
           discard server.closeSubscription(subscription, graceful = false)
+          event.hasResultType = true
+          event.resultType = message.response.result.resultType
+          event.responseBytes = ($toJson(message)).len
           return some(message)
         discard server.openSubscription(request.id, filter, subscriptionHandler)
         return none(McpJsonRpcMessage)
@@ -1052,20 +1093,30 @@ proc handleMessageAsync*(server: McpServer, message: McpJsonRpcMessage,
         server.trackRequest(request.id, context)
         tracked = true
       let value = await server.dispatchAsync(request, context)
+      event.hasResultType = true
+      event.resultType = value.resultType
       if request.kind == mcpNotification:
         return none(McpJsonRpcMessage)
-      return some(successResponse(request.id, value))
+      let response = successResponse(request.id, value)
+      event.responseBytes = ($toJson(response)).len
+      return some(response)
     except McpError as error:
+      event.errorCode = error.code
       if request.kind == mcpNotification:
         return none(McpJsonRpcMessage)
-      return some(errorResponse(request.id, error.code, error.msg, error.data))
+      let response = errorResponse(request.id, error.code, error.msg, error.data)
+      event.responseBytes = ($toJson(response)).len
+      return some(response)
     except CatchableError as error:
       discard error
+      event.errorCode = mcpInternalErrorCode
       context.log(mcpLogError, "request failed: " & request.methodName)
       if request.kind == mcpNotification:
         return none(McpJsonRpcMessage)
-      return some(errorResponse(request.id, mcpInternalErrorCode,
-        "Internal server error"))
+      let response = errorResponse(request.id, mcpInternalErrorCode,
+        "Internal server error")
+      event.responseBytes = ($toJson(response)).len
+      return some(response)
     finally:
       if tracked: server.untrackRequest(request.id)
   of mcpResponseMessage, mcpErrorMessage:
@@ -1083,7 +1134,7 @@ proc handleJsonAsync*(server: McpServer,
   try:
     let message = parseMcpMessage(request)
     context = if message.kind in {mcpRequestMessage, mcpNotificationMessage}:
-      newMcpContext(message.request)
+      newMcpContext(message.request, requestBytes = ($request).len)
     else:
       nil
     let output = await server.handleMessageAsync(message, context)

@@ -11,11 +11,12 @@ import ./nimwire/prompts
 import ./nimwire/resources
 import ./nimwire/schema
 import ./nimwire/security
+import ./nimwire/observability
 import ./nimwire/server
 import ./nimwire/subscriptions
 import ./nimwire/testing
 import ./nimwire/transports/stdio
 import ./nimwire/transports/http
 
-export core, context, auth, mrtr, prompts, resources, schema, security, server, subscriptions,
+export core, context, auth, mrtr, prompts, resources, schema, security, observability, server, subscriptions,
   testing, stdio, http

@@ -23,6 +23,8 @@ Streamable HTTP:
   principal-based feature filters;
 - bounded security controls, redaction helpers, HTTPS URL validation, and
   confined filesystem helpers;
+- structured request logs, trace context, metrics, correlation IDs, and
+  optional OpenTelemetry-friendly span hooks;
 - sync and async tool handlers;
 - a small declarative `mcpServer` template/macro API.
 
@@ -72,6 +74,14 @@ server.addTool mcpTool("whoami", "Read the caller", %*{"type": "object"},
 
 `McpStateStore` provides expiring, subject-bound opaque handles when a workflow
 needs to carry state across otherwise stateless requests.
+
+Use `server.setObservability` to attach optional request logging, metrics, and
+span hooks. Each `McpRequestEvent` includes the method, separate correlation
+ID, transport, trace context, duration, request/response bytes, result or
+error code, cancellation state, and active subscription count. Hooks are
+library-free; `context.log` treats request `logLevel` metadata as the minimum
+level to emit and defaults to `info`. Request content and results are not
+included in events.
 
 Resources use typed text or base64-encoded blob contents:
 

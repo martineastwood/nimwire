@@ -14,17 +14,19 @@ proc writeJson(message: JsonNode) =
 proc writeResponse(message: McpJsonRpcMessage) =
   writeJson(toJson(message))
 
-proc dispatchStdioMessage(server: McpServer, message: McpJsonRpcMessage):
+proc dispatchStdioMessage(server: McpServer, message: McpJsonRpcMessage,
+                          requestBytes: int):
     Future[void] {.async.} =
   let notificationSender: McpNotificationSender =
     proc (notification: JsonNode): Future[void] {.async.} =
       writeJson(notification)
+  let isRequest = message.kind in {mcpRequestMessage, mcpNotificationMessage}
   var context: McpContext
-  if message.kind in {mcpRequestMessage, mcpNotificationMessage}:
+  if isRequest:
     context = newMcpContext(message.request,
       McpTransportInfo(kind: mcpTransportStdio, name: "stdio"),
-      notificationSender = notificationSender)
-  let output = if message.kind in {mcpRequestMessage, mcpNotificationMessage}:
+      notificationSender = notificationSender, requestBytes = requestBytes)
+  let output = if isRequest:
     if message.request.methodName == "subscriptions/listen":
       await server.handleMessageAsync(message, context,
         proc (notification: JsonNode) = writeJson(notification))
@@ -76,7 +78,7 @@ proc serveStdioAsync*(server: McpServer,
       continue
     try:
       let message = parseMcpMessage(line, maxMessageBytes, maxNestingDepth)
-      pending.add server.dispatchStdioMessage(message)
+      pending.add server.dispatchStdioMessage(message, line.len)
     except McpError as error:
       if error.code == mcpParseErrorCode:
         writeResponse(errorResponse(McpId(kind: mcpNullId), error.code,

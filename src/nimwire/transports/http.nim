@@ -452,7 +452,7 @@ proc handleHttpRequest*(server: McpServer, request: McpHttpRequest,
     extensionState = request.extensionState,
     stateStore = request.stateStore, logger = request.logger,
     progress = request.progress, notificationSender = request.notificationSender,
-    deadlineMs = timeoutMs)
+    deadlineMs = timeoutMs, requestBytes = request.body.len)
   if rpcRequest.methodName == "subscriptions/listen" and
       not request.streamWriter.isNil:
     let dispatch = server.handleMessageAsync(message, context,

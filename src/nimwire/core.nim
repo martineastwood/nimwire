@@ -214,7 +214,7 @@ proc toJson*(id: McpId): JsonNode =
   of mcpIntegerId: newJInt(id.integerValue)
   of mcpNullId: newJNull()
 
-proc resultTypeName(resultType: McpResultType): string =
+proc resultTypeName*(resultType: McpResultType): string =
   case resultType
   of mcpComplete: "complete"
   of mcpInputRequired: "input_required"
@@ -319,7 +319,7 @@ proc toJson*(value: McpRpcError): JsonNode =
   if not value.data.isNil:
     result["data"] = value.data
 
-proc logLevelName(level: McpLogLevel): string =
+proc logLevelName*(level: McpLogLevel): string =
   case level
   of mcpLogDebug: "debug"
   of mcpLogInfo: "info"
