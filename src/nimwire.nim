@@ -8,5 +8,6 @@ import ./nimwire/schema
 import ./nimwire/server
 import ./nimwire/testing
 import ./nimwire/transports/stdio
+import ./nimwire/transports/http
 
-export core, schema, server, testing, stdio
+export core, schema, server, testing, stdio, http

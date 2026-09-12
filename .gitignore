@@ -2,6 +2,12 @@ nimcache/
 tests/all_tests
 examples/*
 !examples/*.nim
+!examples/*.conf
 *.dSYM/
 .DS_Store
 nimwire_todo.md
+# Docs site (Astro)
+docs/node_modules/
+docs/dist/
+docs/.astro/
+docs/*.tsbuildinfo
