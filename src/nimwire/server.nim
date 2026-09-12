@@ -5,12 +5,14 @@ import std/[algorithm, asyncdispatch, base64, json, macros, options, strutils,
 
 import ./core
 import ./context
+import ./extensions
 import ./prompts
 import ./resources
 import ./schema
 import ./security
 import ./observability
 import ./subscriptions
+import ./tasks
 
 type
   McpToolHandler* = proc (arguments: JsonNode,
@@ -38,6 +40,7 @@ type
     ## Untrusted caller-facing metadata; never use it as an authorization policy.
     annotations: JsonNode
     handler: McpToolHandler
+    taskHandler: McpTaskHandler
     headerBindings: seq[McpHeaderBinding]
 
   McpServer* = ref object
@@ -67,6 +70,8 @@ type
     promptFilter: McpPromptFilter
     securityLimits: McpSecurityLimits
     observability: McpObservability
+    extensions: McpExtensionRegistry
+    taskStore: McpTaskStore
 
 proc newMcpServer*(name, version: string, instructions = "",
                    listTtlMs = 0, listCacheScope = "private",
@@ -86,7 +91,8 @@ proc newMcpServer*(name, version: string, instructions = "",
     requestStateSealer: requestStateSealer,
     requestStateVerifier: requestStateVerifier,
     activeRequests: initTable[string, McpContext](),
-    toolTimeouts: initTable[string, int]())
+    toolTimeouts: initTable[string, int](),
+    extensions: newMcpExtensionRegistry())
 
 proc resultObject(server: McpServer): McpResult
 proc closeSubscription*(server: McpServer, subscription: McpSubscription,
@@ -117,7 +123,8 @@ proc newMcpTool*(name, description: string, inputSchema: JsonNode,
   if handler.isNil: raise newMcpError("tool handler must not be nil")
   McpTool(name: name, description: description, inputSchema: inputSchema,
     outputSchema: outputSchema, title: title, icons: icons,
-    annotations: annotations, handler: handler, headerBindings: headerBindings)
+    annotations: annotations, handler: handler, taskHandler: nil,
+    headerBindings: headerBindings)
 
 proc newMcpTool*(name, description: string, inputSchema: JsonNode,
                  handler: McpSyncToolHandler,
@@ -127,6 +134,18 @@ proc newMcpTool*(name, description: string, inputSchema: JsonNode,
   newMcpTool(name, description, inputSchema,
     proc (arguments: JsonNode, context: McpContext): Future[McpToolResult] {.async.} =
       handler(arguments, context), outputSchema, title, icons, annotations)
+
+proc newMcpTaskTool*(name, description: string, inputSchema: JsonNode,
+                     handler: McpTaskHandler,
+                     outputSchema: JsonNode = nil, title = "",
+                     icons: JsonNode = nil, annotations: JsonNode = nil): McpTool =
+  let headerBindings = validateToolDefinition(name, description, inputSchema,
+    outputSchema, icons, annotations)
+  if handler.isNil: raise newMcpError("task handler must not be nil")
+  McpTool(name: name, description: description, inputSchema: inputSchema,
+    outputSchema: outputSchema, title: title, icons: icons,
+    annotations: annotations, handler: nil, taskHandler: handler,
+    headerBindings: headerBindings)
 
 template mcpTool*(name, description: string, inputSchema: JsonNode,
                   handler: untyped, outputSchema: JsonNode = nil,
@@ -463,6 +482,7 @@ proc serverMeta(server: McpServer): JsonNode =
 proc resultObject(server: McpServer): McpResult =
   var fields = newJObject()
   fields["_meta"] = serverMeta(server)
+  server.extensions.addExtensionMetadata(fields["_meta"])
   newMcpResult(mcpComplete, fields)
 
 proc toolJson(tool: McpTool): JsonNode =
@@ -656,6 +676,9 @@ proc discover(server: McpServer): McpResult =
     }
   if server.prompts.len > 0 or server.resourceTemplates.len > 0:
     fields["capabilities"]["completions"] = %*{}
+  let extensions = server.extensions.extensionCapabilities()
+  if extensions.len > 0:
+    fields["capabilities"]["extensions"] = extensions
   if server.instructions.len > 0:
     fields["instructions"] = %server.instructions
   newMcpResult(mcpComplete, fields)
@@ -698,6 +721,31 @@ proc setSecurityLimits*(server: McpServer, limits: McpSecurityLimits) =
 proc setObservability*(server: McpServer, hooks: McpObservability) =
   if server.isNil: raise newMcpError("server must not be nil")
   server.observability = hooks
+
+proc registerExtension*(server: McpServer, extension: McpExtension) =
+  if server.isNil: raise newMcpError("server must not be nil")
+  server.extensions.registerExtension(extension)
+
+proc finalizeExtension*(server: McpServer, name: string) =
+  if server.isNil: raise newMcpError("server must not be nil")
+  server.extensions.finalizeExtension(name)
+
+proc hasExtension*(server: McpServer, name: string): bool =
+  not server.isNil and server.extensions.hasFinalizedExtension(name)
+
+proc finalizedExtensions*(server: McpServer): seq[McpExtension] =
+  if not server.isNil: result = server.extensions.finalizedExtensions()
+
+proc draftExtensions*(server: McpServer): seq[McpExtension] =
+  if not server.isNil: result = server.extensions.draftExtensions()
+
+proc enableTasks*(server: McpServer, store: McpTaskStore = nil) =
+  if server.isNil: raise newMcpError("server must not be nil")
+  if server.hasExtension(mcpTasksExtensionName): return
+  let taskStore = if store.isNil: newMcpTaskStore() else: store
+  server.taskStore = taskStore
+  server.registerExtension(newMcpTasksExtension(taskStore))
+  server.finalizeExtension(mcpTasksExtensionName)
 
 proc visibleTool(server: McpServer, name: string,
                  principal: McpPrincipal): bool =
@@ -760,6 +808,12 @@ proc callTool(server: McpServer, params: McpParams,
     raise newMcpError("unknown tool: " & name)
   validateJsonValue(server.tools[index].inputSchema, arguments,
     "tool '" & name & "' arguments")
+  if not server.tools[index].taskHandler.isNil:
+    if server.taskStore.isNil:
+      raise newMcpError("tasks extension is not enabled", mcpMethodNotFoundCode)
+    context.requireClientExtension(mcpTasksExtensionName)
+    return server.taskStore.startMcpTask(server.tools[index].taskHandler,
+      arguments, context, server.tools[index].outputSchema).newMcpTaskResult()
   let configuredTimeout = server.toolTimeouts.getOrDefault(name, 0)
   let remaining = context.remainingTimeMs()
   let timeout = if configuredTimeout > 0 and remaining >= 0:
@@ -978,8 +1032,9 @@ proc validateRoundTripRequest(server: McpServer, request: McpRpcRequest,
   if "inputResponses" notin request.params.values and
       "requestState" notin request.params.values:
     return
-  if request.methodName notin ["tools/call", "prompts/get", "resources/read"]:
-    raise newMcpError("inputResponses and requestState are only valid on tools/call, prompts/get, or resources/read")
+  if request.methodName notin ["tools/call", "prompts/get", "resources/read",
+                               "tasks/update"]:
+    raise newMcpError("inputResponses and requestState are only valid on tools/call, prompts/get, resources/read, or tasks/update")
   discard context.verifyRequestState()
 
 proc dispatchAsync*(server: McpServer, request: McpRpcRequest,
@@ -1007,8 +1062,7 @@ proc dispatchAsync*(server: McpServer, request: McpRpcRequest,
   of "completion/complete":
     result = await server.completeRequest(request.params, context)
   else:
-    raise newMcpError("Method not found: " & request.methodName,
-      mcpMethodNotFoundCode)
+    result = await server.extensions.dispatchExtensionAsync(request, context)
   validateJsonSize(result.fields, server.securityLimits.maxContentBytes,
     "MCP result content")
 

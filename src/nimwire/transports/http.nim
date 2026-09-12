@@ -324,8 +324,13 @@ proc validateRequestHeaders(server: McpServer, request: McpRpcRequest,
     if "name" in request.params.values and
         request.params.values["name"].kind == JString:
       name = request.params.values["name"].getStr
+  of "tasks/get", "tasks/update", "tasks/cancel":
+    if "taskId" in request.params.values and
+        request.params.values["taskId"].kind == JString:
+      name = request.params.values["taskId"].getStr
   else: discard
-  if request.methodName in ["tools/call", "resources/read", "prompts/get"]:
+  if request.methodName in ["tools/call", "resources/read", "prompts/get",
+                            "tasks/get", "tasks/update", "tasks/cancel"]:
     compareHeader(headers, "Mcp-Name", name)
 
   if request.methodName != "tools/call": return

@@ -76,7 +76,8 @@ suite "nimwire MCP server":
             "com.example/clientField": "preserved"
           },
           "io.modelcontextprotocol/clientCapabilities": {
-            "tools": {"listChanged": true}
+            "tools": {"listChanged": true},
+            "extensions": {"com.example/optional": {"enabled": true}}
           },
           "io.modelcontextprotocol/traceContext": {
             "traceparent": "00-abc-def-01",
@@ -99,6 +100,8 @@ suite "nimwire MCP server":
     check parsed.request.params.meta.clientInfo.name == "test-client"
     check parsed.request.params.meta.clientCapabilities.fields["tools"][
       "listChanged"].getBool
+    check parsed.request.params.meta.clientCapabilities.fields["extensions"][
+      "com.example/optional"]["enabled"].getBool
     check parsed.request.params.meta.hasTraceContext
     check parsed.request.params.meta.traceContext.traceparent == "00-abc-def-01"
     check parsed.request.params.meta.traceContext.extensionFields["vendor"][
@@ -112,6 +115,8 @@ suite "nimwire MCP server":
       "com.example/clientField"].getStr == "preserved"
     check roundTrip["params"]["_meta"]["com.example/extension"][
       "enabled"].getBool
+    check roundTrip["params"]["_meta"][mcpMetaClientCapabilitiesKey][
+      "extensions"]["com.example/optional"]["enabled"].getBool
 
   test "models result types and error responses":
     let result = newMcpResult(mcpInputRequired, %*{
@@ -1472,3 +1477,269 @@ suite "nimwire observability":
     check events.len == 1
     check events[0].cancelled
     check events[0].errorCode == mcpRequestCancelledCode
+
+suite "nimwire tasks and extensions":
+  proc taskRequest(id: int, methodName: string,
+                   params: JsonNode = newJObject()): JsonNode =
+    result = modernRequest(id, methodName, params)
+    result["params"]["_meta"][mcpMetaClientCapabilitiesKey]["extensions"] =
+      %*{mcpTasksExtensionName: {}}
+
+  proc taskHttpHeaders(methodName, name: string): seq[McpHttpHeader] =
+    @[
+      header("Content-Type", "application/json"),
+      header("Accept", "application/json, text/event-stream"),
+      header("MCP-Protocol-Version", mcpProtocolVersion),
+      header("Mcp-Method", methodName),
+      header("Mcp-Name", name)]
+
+  test "advertises tasks and polls a completed task":
+    let server = newMcpServer("tasks", "1.0.0")
+    server.enableTasks(newMcpTaskStore(pollIntervalMs = 1))
+    server.addTool newMcpTaskTool("slow", "Slow task", %*{
+      "type": "object"
+    }, proc (args: JsonNode, context: McpContext): Future[McpResult] {.async.} =
+      await context.reportProgress(0.5, 1.0, "halfway")
+      await sleepAsync(5)
+      newMcpResult(mcpComplete, %*{
+        "content": [{"type": "text", "text": "done"}],
+        "isError": false
+      }))
+
+    var response = server.handleJson(modernRequest(180, "server/discover"))
+    check response["result"]["capabilities"]["extensions"][
+      mcpTasksExtensionName].kind == JObject
+    let missing = server.handleJson(modernRequest(181, "tools/call", %*{
+      "name": "slow", "arguments": {}
+    }))
+    check missing["error"]["code"].getInt ==
+      mcpMissingRequiredClientCapabilityCode
+    check missing["error"]["data"]["requiredCapabilities"]["extensions"][
+      mcpTasksExtensionName].kind == JObject
+
+    response = server.handleJson(taskRequest(182, "tools/call", %*{
+      "name": "slow", "arguments": {}
+    }))
+    check response["result"]["resultType"].getStr == "task"
+    let taskId = response["result"]["taskId"].getStr
+    check taskId.startsWith("nimwire.task.")
+    waitFor sleepAsync(10)
+    response = server.handleJson(taskRequest(183, "tasks/get", %*{
+      "taskId": taskId
+    }))
+    check response["result"]["resultType"].getStr == "complete"
+    check response["result"]["status"].getStr == "completed"
+    check response["result"]["progress"].getFloat == 0.5
+    check response["result"]["total"].getFloat == 1.0
+    check response["result"]["result"]["content"][0]["text"].getStr == "done"
+
+  test "routes task polling with the Streamable HTTP task header":
+    let server = newMcpServer("task-http", "1.0.0")
+    server.enableTasks()
+    server.addTool newMcpTaskTool("http-task", "HTTP task", %*{
+      "type": "object"
+    }, proc (args: JsonNode, context: McpContext): Future[McpResult] {.async.} =
+      newMcpResult(mcpComplete, %*{"content": [], "isError": false}))
+    let body = taskRequest(201, "tools/call", %*{
+      "name": "http-task", "arguments": {}
+    })
+    var response = waitFor server.handleHttpRequest(newMcpHttpRequest(
+      "POST", "/mcp", $body, taskHttpHeaders("tools/call", "http-task")))
+    check response.status == 200
+    let taskId = response.body.parseJson["result"]["taskId"].getStr
+    let poll = taskRequest(202, "tasks/get", %*{"taskId": taskId})
+    response = waitFor server.handleHttpRequest(newMcpHttpRequest(
+      "POST", "/mcp", $poll, taskHttpHeaders("tasks/get", taskId)))
+    check response.status == 200
+    check response.body.parseJson["result"]["status"].getStr == "completed"
+    response = waitFor server.handleHttpRequest(newMcpHttpRequest(
+      "POST", "/mcp", $poll, taskHttpHeaders("tasks/get", "wrong")))
+    check response.status == 400
+    check response.body.parseJson["error"]["code"].getInt ==
+      mcpHeaderMismatchCode
+
+  test "supports durable stores and expires task handles":
+    var saved: McpTask
+    let durable = newMcpTaskStoreBackend(
+      proc (task: McpTask) = saved = task,
+      proc (taskId, subject: string): McpTask =
+        if not saved.isNil and saved.taskId == taskId and saved.owner == subject:
+          saved
+        else:
+          nil,
+      proc (task: McpTask) = saved = task)
+    let server = newMcpServer("durable-tasks", "1.0.0")
+    server.enableTasks(durable)
+    server.addTool newMcpTaskTool("stored", "Stored task", %*{
+      "type": "object"
+    }, proc (args: JsonNode, context: McpContext): Future[McpResult] {.async.} =
+      newMcpResult(mcpComplete, %*{"content": [], "isError": false}))
+    let created = server.handleJson(taskRequest(197, "tools/call", %*{
+      "name": "stored", "arguments": {}
+    }))
+    check not saved.isNil
+    check saved.taskId == created["result"]["taskId"].getStr
+    waitFor sleepAsync(1)
+    let fetched = server.handleJson(taskRequest(198, "tasks/get", %*{
+      "taskId": saved.taskId
+    }))
+    check fetched["result"]["status"].getStr == "completed"
+
+    let expiring = newMcpServer("expiring-tasks", "1.0.0")
+    expiring.enableTasks(newMcpTaskStore(ttlMs = 1))
+    expiring.addTool newMcpTaskTool("short", "Short task", %*{
+      "type": "object"
+    }, proc (args: JsonNode, context: McpContext): Future[McpResult] {.async.} =
+      newMcpResult(mcpComplete, %*{"content": [], "isError": false}))
+    let short = expiring.handleJson(taskRequest(199, "tools/call", %*{
+      "name": "short", "arguments": {}
+    }))
+    waitFor sleepAsync(10)
+    let expired = expiring.handleJson(taskRequest(200, "tasks/get", %*{
+      "taskId": short["result"]["taskId"].getStr
+    }))
+    check expired["error"]["code"].getInt == mcpInvalidParamsCode
+
+  test "moves tasks through input, update, and cancellation":
+    let server = newMcpServer("task-flow", "1.0.0")
+    server.enableTasks()
+    server.addTool newMcpTaskTool("input", "Needs input", %*{
+      "type": "object"
+    }, proc (args: JsonNode, context: McpContext): Future[McpResult] {.async.} =
+      if context.inputResponses.len == 0:
+        newMcpResult(mcpInputRequired, %*{
+          "inputRequests": {
+            "name": {"method": "elicitation/create", "params": {
+              "mode": "form", "message": "Name", "requestedSchema": {
+                "type": "object", "properties": {"name": {"type": "string"}}
+              }
+            }}
+          }
+        })
+      else:
+        newMcpResult(mcpComplete, %*{
+          "content": [{"type": "text",
+                        "text": context.inputResponse("name")["content"]["name"].getStr}],
+          "isError": false
+        }))
+    let created = server.handleJson(taskRequest(184, "tools/call", %*{
+      "name": "input", "arguments": {}
+    }))
+    let taskId = created["result"]["taskId"].getStr
+    waitFor sleepAsync(1)
+    var response = server.handleJson(taskRequest(185, "tasks/get", %*{
+      "taskId": taskId
+    }))
+    check response["result"]["status"].getStr == "input_required"
+    check response["result"]["inputRequests"]["name"].kind == JObject
+    response = server.handleJson(taskRequest(186, "tasks/update", %*{
+      "taskId": taskId,
+      "inputResponses": {"name": {"action": "accept",
+        "content": {"name": "Ada"}}}
+    }))
+    check response["result"]["resultType"].getStr == "complete"
+    waitFor sleepAsync(1)
+    response = server.handleJson(taskRequest(187, "tasks/get", %*{
+      "taskId": taskId
+    }))
+    check response["result"]["status"].getStr == "completed"
+    check response["result"]["result"]["content"][0]["text"].getStr == "Ada"
+
+    server.addTool newMcpTaskTool("cancel", "Cancellable", %*{
+      "type": "object"
+    }, proc (args: JsonNode, context: McpContext): Future[McpResult] {.async.} =
+      await sleepAsync(50)
+      context.checkCancelled()
+      newMcpResult(mcpComplete, %*{"content": [], "isError": false}))
+    let cancellable = server.handleJson(taskRequest(188, "tools/call", %*{
+      "name": "cancel", "arguments": {}
+    }))
+    let cancellableId = cancellable["result"]["taskId"].getStr
+    discard server.handleJson(taskRequest(189, "tasks/cancel", %*{
+      "taskId": cancellableId
+    }))
+    response = server.handleJson(taskRequest(190, "tasks/get", %*{
+      "taskId": cancellableId
+    }))
+    check response["result"]["status"].getStr == "cancelled"
+
+  test "records task failures for later retrieval":
+    let server = newMcpServer("failed-tasks", "1.0.0")
+    server.enableTasks()
+    server.addTool newMcpTaskTool("failed", "Failed task", %*{
+      "type": "object"
+    }, proc (args: JsonNode, context: McpContext): Future[McpResult] {.async.} =
+      raise newMcpError("task failed", mcpInvalidParamsCode, %*{
+        "reason": "test"
+      }))
+    let created = server.handleJson(taskRequest(203, "tools/call", %*{
+      "name": "failed", "arguments": {}
+    }))
+    waitFor sleepAsync(1)
+    let response = server.handleJson(taskRequest(204, "tasks/get", %*{
+      "taskId": created["result"]["taskId"].getStr
+    }))
+    check response["result"]["status"].getStr == "failed"
+    check response["result"]["error"]["code"].getInt == mcpInvalidParamsCode
+    check response["result"]["error"]["data"]["reason"].getStr == "test"
+
+  test "finalizes generic extensions and dispatches their schemas":
+    let server = newMcpServer("extensions", "1.0.0")
+    let extension = newMcpExtension("com.example/demo",
+      capabilities = %*{"version": 1},
+      metadata = %*{"com.example/serverMode": "demo"},
+      requiresClientCapability = true)
+    extension.addExtensionMethod("com.example/echo",
+      proc (params: JsonNode, context: McpContext): Future[McpResult] {.async.} =
+        newMcpResult(mcpComplete, %*{"echo": params["value"]}),
+      inputSchema = %*{"type": "object", "required": ["value"],
+                       "properties": {"value": {"type": "string"}}},
+      outputSchema = %*{"type": "object", "required": ["echo"]},
+      transportRules = %*{"Mcp-Name": "optional"})
+    server.registerExtension(extension)
+    check server.draftExtensions.len == 1
+    check server.finalizedExtensions.len == 0
+    server.finalizeExtension("com.example/demo")
+    check server.draftExtensions.len == 0
+    check server.finalizedExtensions.len == 1
+    var response = server.handleJson(modernRequest(191, "server/discover"))
+    check response["result"]["capabilities"]["extensions"][
+      "com.example/demo"]["version"].getInt == 1
+    check response["result"]["_meta"]["com.example/serverMode"].getStr == "demo"
+    let missing = server.handleJson(modernRequest(192, "com.example/echo", %*{
+      "value": "x"
+    }))
+    check missing["error"]["code"].getInt ==
+      mcpMissingRequiredClientCapabilityCode
+    var request = modernRequest(193, "com.example/echo", %*{"value": "x"})
+    request["params"]["_meta"][mcpMetaClientCapabilitiesKey]["extensions"] =
+      %*{"com.example/demo": {}}
+    response = server.handleJson(request)
+    check response["result"]["echo"].getStr == "x"
+    request = modernRequest(194, "com.example/echo", %*{"value": 1})
+    request["params"]["_meta"][mcpMetaClientCapabilitiesKey]["extensions"] =
+      %*{"com.example/demo": {}}
+    response = server.handleJson(request)
+    check response["error"]["code"].getInt == mcpInvalidParamsCode
+
+  test "scopes task handles to their authenticated principal":
+    let server = newMcpServer("task-scope", "1.0.0")
+    server.enableTasks()
+    server.addTool newMcpTaskTool("owned", "Owned task", %*{
+      "type": "object"
+    }, proc (args: JsonNode, context: McpContext): Future[McpResult] {.async.} =
+      newMcpResult(mcpComplete, %*{"content": [], "isError": false}))
+    let request = taskRequest(195, "tools/call", %*{
+      "name": "owned", "arguments": {}
+    })
+    let message = parseMcpMessage(request)
+    let created = waitFor server.handleMessageAsync(message,
+      newMcpContext(message.request, principal = newMcpPrincipal("alice")))
+    let taskId = created.get.response.result.fields["taskId"].getStr
+    let getRequest = parseMcpMessage(taskRequest(196, "tasks/get", %*{
+      "taskId": taskId
+    }))
+    let denied = waitFor server.handleMessageAsync(getRequest,
+      newMcpContext(getRequest.request,
+        principal = newMcpPrincipal("bob")))
+    check denied.get.errorResponse.error.code == mcpInvalidParamsCode

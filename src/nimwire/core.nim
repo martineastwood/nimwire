@@ -14,6 +14,7 @@ const
   mcpServerBusyCode* = -32029
   mcpHeaderMismatchCode* = -32020
   mcpUnsupportedProtocolVersionCode* = -32022
+  mcpMissingRequiredClientCapabilityCode* = -32021
   mcpDefaultMaxMessageBytes* = 1024 * 1024
   mcpDefaultMaxNestingDepth* = 64
   mcpDefaultCompletionLimit* = 100
@@ -96,6 +97,7 @@ type
   McpResultType* = enum
     mcpComplete
     mcpInputRequired
+    mcpTask
 
   McpResult* = object
     resultType*: McpResultType
@@ -218,12 +220,14 @@ proc resultTypeName*(resultType: McpResultType): string =
   case resultType
   of mcpComplete: "complete"
   of mcpInputRequired: "input_required"
+  of mcpTask: "task"
 
 proc parseResultType(value: string): McpResultType =
   case value
   of "complete": mcpComplete
   of "input_required": mcpInputRequired
-  else: raise invalidRequest("resultType must be complete or input_required")
+  of "task": mcpTask
+  else: raise invalidRequest("resultType must be complete, input_required, or task")
 
 proc inputRequestMethod(methodName: string): bool =
   methodName in ["elicitation/create", "sampling/createMessage", "roots/list"]

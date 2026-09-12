@@ -25,6 +25,10 @@ Streamable HTTP:
   confined filesystem helpers;
 - structured request logs, trace context, metrics, correlation IDs, and
   optional OpenTelemetry-friendly span hooks;
+- opt-in MCP Tasks with durable-store hooks, polling, input updates, and
+  cancellation;
+- generic finalized extension registration with capability negotiation and
+  schema-validated methods;
 - sync and async tool handlers;
 - a small declarative `mcpServer` template/macro API.
 
@@ -36,7 +40,8 @@ prompt definitions and messages, and
 request-scoped handler context, `nimwire/mrtr` provides multi-round-trip input
 handling, `nimwire/auth` provides HTTP authorization hooks, `nimwire/security`
 provides reusable limits and redaction, while `nimwire/testing` provides
-in-process request helpers.
+in-process request helpers. `nimwire/tasks` adds the opt-in Tasks extension and
+`nimwire/extensions` adds generic extension registration.
 
 Use `parseMcpMessage` and `toJson` at custom transport boundaries. The parser
 enforces a 1 MiB message limit and 64 levels of nesting by default; both are
@@ -134,6 +139,21 @@ notification through the transport's notification sender. Set
 or `server.cancelActiveRequests` during shutdown. HTTP adapters should call
 `request.cancellation.cancel("client disconnected")` when their framework
 reports a closed request stream.
+
+Enable long-running tools with `server.enableTasks()` and
+`newMcpTaskTool`. The server advertises `io.modelcontextprotocol/tasks` only
+when enabled, requires that capability on each task-augmented request, returns
+`resultType: "task"`, and exposes `tasks/get`, `tasks/update`, and
+`tasks/cancel`. The default in-memory store uses unguessable, expiring,
+principal-scoped handles; `newMcpTaskStoreBackend` supplies durable storage
+callbacks. Task handlers may return `complete` or `input_required`, and task
+poll results include progress, pending input, or the final result/error.
+
+Register other extensions with `newMcpExtension`, `server.registerExtension`,
+and `server.finalizeExtension`. Draft extensions are neither advertised nor
+dispatched. Finalized extensions contribute capabilities, metadata, methods,
+schemas, and transport rules, while unknown client extension capability fields
+remain available for proxying and composition.
 
 Remote HTTP authorization is opt-in. Pass an `McpAuthorizationConfig` to
 `newMcpHttpConfig`; its verifier receives the bearer token and resource and
