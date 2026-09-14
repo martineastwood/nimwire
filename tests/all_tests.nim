@@ -70,7 +70,7 @@ suite "nimwire MCP server":
         mcpResult(Weather(temperature: 20, condition: city & ": clear"))
     server.tool "typed-error", "Typed error handler",
       proc (city: string): McpResult[Weather] =
-        mcpError[Weather]("unavailable", "weather unavailable",
+        mcpResultError[Weather]("unavailable", "weather unavailable",
           %*{"city": city})
     server.tool "async-typed-result", "Async typed result handler",
       proc (city: string): Future[McpResult[Weather]] {.async.} =
@@ -890,28 +890,6 @@ suite "nimwire resources":
       "uri": "demo:///acme"
     }))
     check response["error"]["code"].getInt == mcpInvalidParamsCode
-
-  test "emits subscribed resource change notifications":
-    let server = newMcpServer("notifications", "1.0.0")
-    server.addResource newMcpResource("memo://one", "one",
-      resourceText("memo://one", "one"))
-    var notifications: seq[JsonNode]
-    let notificationHandler: McpResourceNotificationHandler =
-      proc (message: JsonNode) = notifications.add message
-    let subscription = server.subscribeResources(
-      McpId(kind: mcpIntegerId, integerValue: 39), notificationHandler,
-      resourcesListChanged = true, resourceUris = @["memo://one"])
-    server.markResourcesChanged()
-    server.markResourceUpdated("memo://one")
-    check notifications.len == 2
-    check notifications[0]["method"].getStr ==
-      "notifications/resources/list_changed"
-    check notifications[1]["method"].getStr ==
-      "notifications/resources/updated"
-    check notifications[1]["params"]["uri"].getStr == "memo://one"
-    check notifications[1]["params"]["_meta"][
-      "io.modelcontextprotocol/subscriptionId"].getInt == 39
-    check server.unsubscribeResources(subscription)
 
   test "confines file resources to their root":
     let root = getTempDir() / ("nimwire-resource-" & $getCurrentProcessId())

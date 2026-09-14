@@ -43,9 +43,6 @@ type
 proc newMcpEventBus*(publisher: McpEventPublisher = nil): McpEventBus =
   McpEventBus(publisher: publisher)
 
-proc sameId(left, right: McpId): bool =
-  $toJson(left) == $toJson(right)
-
 proc subscribe*(bus: McpEventBus, id: McpId,
                 filter: McpSubscriptionFilter,
                 handler: McpSubscriptionMessageHandler): McpSubscription =
@@ -55,7 +52,7 @@ proc subscribe*(bus: McpEventBus, id: McpId,
   if handler.isNil:
     raise newMcpError("subscription handler must not be nil")
   for current in bus.subscriptions:
-    if current.active and current.id.sameId(id):
+    if current.active and current.id == id:
       raise newMcpError("duplicate subscription id")
   result = McpSubscription(id: id, filter: filter, active: true,
     handler: handler, bus: bus,

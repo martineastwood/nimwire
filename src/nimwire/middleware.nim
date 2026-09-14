@@ -136,11 +136,3 @@ proc runMcpToolMiddleware*(middlewares: seq[McpToolMiddleware], index: int,
     await runMcpToolMiddleware(middlewares, index + 1, name, arguments,
       context, terminal)
   await current(name, arguments, context, next)
-
-proc composeMcpToolMiddleware*(middlewares: openArray[McpToolMiddleware]):
-    McpToolMiddleware =
-  ## Compose in declaration order: the first middleware is the outermost.
-  let declared = @middlewares
-  result = proc (name: string, arguments: JsonNode, context: McpContext,
-                 next: McpToolNext): Future[McpToolResult] {.async.} =
-    await runMcpToolMiddleware(declared, 0, name, arguments, context, next)

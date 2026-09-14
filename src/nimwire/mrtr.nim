@@ -231,20 +231,18 @@ proc setRootsHandler*(client: McpInputClient,
                       handler: McpInputResponseHandler) =
   client.rootsHandler = handler
 
-proc sameId(left, right: McpId): bool = $toJson(left) == $toJson(right)
-
 proc rememberRequest*(client: McpInputClient, id: McpId) =
   if client.isNil: raise newMcpError("input client must not be nil")
   if id.kind == mcpNullId:
     raise newMcpError("request id must not be null")
   for existing in client.usedRequestIds:
-    if sameId(existing, id):
+    if existing == id:
       raise newMcpError("request id has already been used")
   client.usedRequestIds.add id
 
 proc hasRequestId(client: McpInputClient, id: McpId): bool =
   for existing in client.usedRequestIds:
-    if sameId(existing, id): return true
+    if existing == id: return true
   false
 
 proc freshRequestId*(client: McpInputClient): McpId =
@@ -287,7 +285,7 @@ proc retryInputRequired*(client: McpInputClient,
                          retryId: McpId): McpJsonRpcMessage =
   if original.kind != mcpRequestMessage or response.kind != mcpResponseMessage:
     raise newMcpError("MRTR retry requires a request and result response")
-  if not sameId(original.request.id, response.response.id):
+  if original.request.id != response.response.id:
     raise newMcpError("MRTR response id does not match the request")
   if response.response.result.resultType != mcpInputRequired:
     raise newMcpError("MRTR retry requires an input_required result")

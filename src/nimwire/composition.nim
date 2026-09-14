@@ -324,19 +324,21 @@ proc mountMcpServerAsync*(server: McpServer, proxy: McpProxy):
   if proxy.isNil or proxy.peer.isNil:
     raise newMcpError("MCP proxy must not be nil")
   let discovery = await proxy.peer.requestAsync("server/discover")
-  if discovery.resultType != mcpComplete or "capabilities" notin discovery.fields:
+  if discovery.resultType != mcpComplete or "capabilities" notin discovery.fields or
+      discovery.fields["capabilities"].kind != JObject:
     raise newMcpError("remote server discovery returned invalid capabilities")
   let capabilities = discovery.fields["capabilities"]
+  let hasCompletions = "completions" in capabilities
   var tools: seq[McpTool]
   var resources: seq[McpResource]
   var templates: seq[McpResourceTemplate]
   var prompts: seq[McpPrompt]
   var remotePromptNames: seq[string]
   var remoteTemplateNames: seq[string]
-  if capabilities.kind == JObject and "tools" in capabilities:
+  if "tools" in capabilities:
     for item in await pagedListAsync(proxy.peer, "tools/list", "tools"):
       tools.add proxy.proxyTool(item)
-  if capabilities.kind == JObject and "resources" in capabilities:
+  if "resources" in capabilities:
     for item in await pagedListAsync(proxy.peer, "resources/list", "resources"):
       resources.add proxy.proxyResource(item)
     for item in await pagedListAsync(proxy.peer, "resources/templates/list",
@@ -344,7 +346,7 @@ proc mountMcpServerAsync*(server: McpServer, proxy: McpProxy):
       templates.add proxy.proxyResourceTemplate(item)
       remoteTemplateNames.add requiredString(item, "uriTemplate",
         "remote resource template")
-  if capabilities.kind == JObject and "prompts" in capabilities:
+  if "prompts" in capabilities:
     for item in await pagedListAsync(proxy.peer, "prompts/list", "prompts"):
       prompts.add proxy.proxyPrompt(item)
       remotePromptNames.add requiredString(item, "name", "remote prompt")
@@ -353,12 +355,12 @@ proc mountMcpServerAsync*(server: McpServer, proxy: McpProxy):
   for resource in resources: server.addResource(resource)
   for index, resourceTemplate in templates:
     server.addResourceTemplate(resourceTemplate)
-    if capabilities.kind == JObject and "completions" in capabilities:
+    if hasCompletions:
       server.addProxyResourceCompletions(proxy, resourceTemplate,
         remoteTemplateNames[index])
   for index, prompt in prompts:
     server.addPrompt(prompt)
-    if capabilities.kind == JObject and "completions" in capabilities:
+    if hasCompletions:
       server.addProxyPromptCompletions(proxy, prompt, remotePromptNames[index])
   if tools.len > 0: server.markToolsChanged()
   if resources.len > 0 or templates.len > 0: server.markResourcesChanged()
@@ -376,11 +378,3 @@ proc mountMcpServer*(server: McpServer, proxy: McpProxy) =
 proc mountMcpServer*(server: McpServer, transport: McpMessageTransport,
                      namespace = "remote"): McpProxy =
   waitFor server.mountMcpServerAsync(transport, namespace)
-
-proc mountMcpProxyAsync*(server: McpServer, transport: McpMessageTransport,
-                         namespace = "remote"): Future[McpProxy] {.async.} =
-  await server.mountMcpServerAsync(transport, namespace)
-
-proc mountMcpProxy*(server: McpServer, transport: McpMessageTransport,
-                    namespace = "remote"): McpProxy =
-  server.mountMcpServer(transport, namespace)

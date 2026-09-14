@@ -259,8 +259,7 @@ proc validateUriTemplate*(uriTemplate: string) =
   for character in uriTemplate:
     if character.ord < 32 or character in {' ', '\t', '\r', '\n'}:
       raise invalidResource("resource URI template contains invalid whitespace")
-  for expression in templateExpressions(uriTemplate):
-    discard expression
+  discard templateExpressions(uriTemplate)
   var literal = uriTemplate
   for character in ['{', '}']:
     literal = literal.replace($character, "")

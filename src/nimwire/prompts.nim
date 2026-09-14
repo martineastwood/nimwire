@@ -207,12 +207,6 @@ proc newMcpPrompt*(name: string, handler: McpSyncPromptSingleHandler,
       @[handler(promptArguments, context)],
     title, description, arguments, icons)
 
-proc newMcpPrompt*(name, description: string,
-                   arguments: seq[McpPromptArgument],
-                   handler: McpPromptHandler, title = "",
-                   icons: JsonNode = nil): McpPrompt =
-  newMcpPrompt(name, handler, title, description, arguments, icons)
-
 proc newMcpCompletion*(argument: string,
                        handler: McpCompletionHandler): McpCompletion =
   if argument.len == 0:
@@ -232,12 +226,6 @@ proc newMcpCompletion*(argument: string,
 template mcpCompletion*(argument: string, handler: untyped): McpCompletion =
   ## Reusable prompt/resource-template completion declaration.
   newMcpCompletion(argument, handler)
-
-proc newMcpPrompt*(name, description: string,
-                   arguments: seq[McpPromptArgument],
-                   handler: McpSyncPromptHandler, title = "",
-                   icons: JsonNode = nil): McpPrompt =
-  newMcpPrompt(name, handler, title, description, arguments, icons)
 
 template mcpPrompt*(name: string, handler: untyped, title = "",
                     description = "", arguments: seq[McpPromptArgument] = @[],
@@ -301,12 +289,7 @@ proc decodePromptArguments*(prompt: McpPrompt,
   for key, value in values.pairs:
     if value.kind != JString:
       raise newMcpError("prompt argument '" & key & "' must be a string")
-    var known = false
-    for argument in prompt.arguments:
-      if argument.name == key:
-        known = true
-        break
-    if not known:
+    if not prompt.promptHasArgument(key):
       raise newMcpError("unknown prompt argument: " & key)
     result[key] = value.getStr
   for argument in prompt.arguments:

@@ -118,11 +118,11 @@ proc requestAsync*(peer: McpPeer, methodName: string,
     McpJsonRpcMessage(kind: mcpRequestMessage, request: request))
   case message.kind
   of mcpResponseMessage:
-    if $toJson(message.response.id) != $toJson(id):
+    if message.response.id != id:
       raise newMcpError("MCP transport returned a response for the wrong request")
     return message.response.result
   of mcpErrorMessage:
-    if $toJson(message.errorResponse.id) != $toJson(id):
+    if message.errorResponse.id != id:
       raise newMcpError("MCP transport returned an error for the wrong request")
     let error = message.errorResponse.error
     raise newMcpError(error.message, error.code, error.data)

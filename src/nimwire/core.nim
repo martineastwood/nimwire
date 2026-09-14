@@ -116,10 +116,11 @@ type
   McpResult*[T] = object
     ## A typed handler result. It is converted to `McpToolResult` at the wire
     ## boundary and never leaks protocol-specific fields into application code.
-    value*: T
-    isError*: bool
-    error*: McpTypedError
-    hasError*: bool
+    case isError*: bool
+    of false:
+      value*: T
+    of true:
+      error*: McpTypedError
 
   McpRpcError* = object
     code*: int
@@ -185,7 +186,7 @@ proc retryableMcpError*(message: string, code = mcpInternalErrorCode,
   result.retryable = true
 
 proc mcpResult*[T](value: T): McpResult[T] =
-  McpResult[T](value: value)
+  McpResult[T](isError: false, value: value)
 
 proc mcpResultError*[T](code, message: string, details: JsonNode = nil,
                         retryable = false): McpResult[T] =
@@ -193,11 +194,7 @@ proc mcpResultError*[T](code, message: string, details: JsonNode = nil,
     raise newMcpError("typed result errors require a code and message")
   McpResult[T](isError: true,
     error: McpTypedError(code: code, message: message, details: details,
-      retryable: retryable), hasError: true)
-
-proc mcpError*[T](code, message: string, details: JsonNode = nil,
-                  retryable = false): McpResult[T] =
-  mcpResultError[T](code, message, details, retryable)
+      retryable: retryable))
 
 proc mcpFailure*[T](message: string, details: JsonNode = nil,
                     retryable = false): McpResult[T] =
@@ -255,6 +252,13 @@ proc toJson*(id: McpId): JsonNode =
   of mcpStringId: newJString(id.stringValue)
   of mcpIntegerId: newJInt(id.integerValue)
   of mcpNullId: newJNull()
+
+proc `==`*(left, right: McpId): bool =
+  if left.kind != right.kind: return false
+  case left.kind
+  of mcpStringId: left.stringValue == right.stringValue
+  of mcpIntegerId: left.integerValue == right.integerValue
+  of mcpNullId: true
 
 proc resultTypeName*(resultType: McpResultType): string =
   case resultType
@@ -575,7 +579,6 @@ proc parseMcpMessage*(node: JsonNode,
                       maxNestingDepth = mcpDefaultMaxNestingDepth): McpJsonRpcMessage =
   if node.isNil or node.kind != JObject:
     raise invalidRequest("invalid JSON-RPC message")
-  checkNestingDepth(node, maxNestingDepth)
   if "method" in node:
     let request = parseMcpRequest(node, maxNestingDepth)
     result = if request.kind == mcpRequest:
@@ -583,12 +586,15 @@ proc parseMcpMessage*(node: JsonNode,
     else:
       McpJsonRpcMessage(kind: mcpNotificationMessage, request: request)
   elif "result" in node:
+    checkNestingDepth(node, maxNestingDepth)
     result = McpJsonRpcMessage(kind: mcpResponseMessage,
       response: parseMcpResponse(node))
   elif "error" in node:
+    checkNestingDepth(node, maxNestingDepth)
     result = McpJsonRpcMessage(kind: mcpErrorMessage,
       errorResponse: parseMcpErrorResponse(node))
   else:
+    checkNestingDepth(node, maxNestingDepth)
     raise invalidRequest("invalid JSON-RPC message")
 
 proc nestingDepth(node: JsonNode): int =
@@ -776,19 +782,16 @@ proc typedResultJson*[T](value: T): JsonNode =
 
 proc toMcpToolResult*[T](value: McpResult[T]): McpToolResult =
   if value.isError:
-    let message = if value.hasError: value.error.message else: "typed tool failed"
-    result = textResult(message, isError = true)
-    result.retryable = value.hasError and value.error.retryable
+    result = textResult(value.error.message, isError = true)
+    result.retryable = value.error.retryable
     return
   structuredResult(typedResultJson(value.value))
 
 proc toJson*[T](value: McpResult[T]): JsonNode =
   if value.isError:
-    result = %*{"isError": true}
-    if value.hasError:
-      result["error"] = %*{"code": value.error.code,
-        "message": value.error.message}
-      if not value.error.details.isNil:
-        result["error"]["details"] = value.error.details
+    result = %*{"isError": true,
+      "error": {"code": value.error.code, "message": value.error.message}}
+    if not value.error.details.isNil:
+      result["error"]["details"] = value.error.details
   else:
     typedResultJson(value.value)

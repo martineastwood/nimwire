@@ -43,9 +43,6 @@ proc newMcpInProcessTransport*(server: McpServer): McpMessageTransport =
       Future[void] {.async.} = await state.dispatchNotification(message)
   newMcpMessageTransport(request, notification, proc () = state.closed = true)
 
-proc newMcpLinkedTransport*(server: McpServer): McpMessageTransport =
-  newMcpInProcessTransport(server)
-
 proc newMcpInProcessPeer*(server: McpServer,
                           metadata = McpRequestMeta()): McpPeer =
   newMcpPeer(newMcpInProcessTransport(server), metadata)

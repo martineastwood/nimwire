@@ -11,7 +11,6 @@ const mcpTasksExtensionName* = "io.modelcontextprotocol/tasks"
 
 type
   McpTaskStatus* = enum
-    mcpTaskQueued
     mcpTaskWorking
     mcpTaskInputRequired
     mcpTaskCompleted
@@ -62,11 +61,9 @@ type
     arguments: JsonNode
     context: McpContext
     outputSchema: JsonNode
-    running: bool
 
 proc taskStatusName*(status: McpTaskStatus): string =
   case status
-  of mcpTaskQueued: "queued"
   of mcpTaskWorking: "working"
   of mcpTaskInputRequired: "input_required"
   of mcpTaskCompleted: "completed"
@@ -211,21 +208,15 @@ proc runTask(store: McpTaskStore, task: McpTask): Future[void] {.async.} =
       task.status = mcpTaskInputRequired
       task.statusMessage = "Input required"
       task.touch()
-      runtime.running = false
       store.saveUpdate(task)
     of mcpTask:
       raise newMcpError("task handlers must return complete or input_required")
   except McpError as error:
-    runtime.running = false
     if task.status != mcpTaskCancelled and not task.cancellation.isCancelled:
       store.fail(task, error.code, error.msg, error.data)
   except CatchableError:
-    runtime.running = false
     if task.status != mcpTaskCancelled and not task.cancellation.isCancelled:
       store.fail(task, mcpInternalErrorCode, "Internal server error")
-  finally:
-    if task.status in {mcpTaskCompleted, mcpTaskFailed, mcpTaskCancelled}:
-      runtime.running = false
 
 proc startMcpTask*(store: McpTaskStore, handler: McpTaskHandler,
                    arguments: JsonNode, context: McpContext,
@@ -241,7 +232,7 @@ proc startMcpTask*(store: McpTaskStore, handler: McpTaskHandler,
     owner: owner, expiresAt: if store.ttlMs > 0: nowMs + store.ttlMs else: 0,
     cancellation: newMcpCancellation())
   result.runtime = McpTaskRuntime(handler: handler, arguments: arguments,
-    context: context, outputSchema: outputSchema, running: true)
+    context: context, outputSchema: outputSchema)
   let task = result
   let previousProgress = if context.isNil: nil else: context.progress
   if not context.isNil:
@@ -287,7 +278,6 @@ proc updateMcpTask*(store: McpTaskStore, taskId: string,
     task.status = mcpTaskWorking
     task.statusMessage = ""
     task.touch()
-    task.runtime.running = true
     store.saveUpdate(task)
     asyncCheck runTask(store, task)
   else:
