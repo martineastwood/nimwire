@@ -6,6 +6,7 @@ import std/[algorithm, asyncdispatch, base64, json, macros, options, strutils,
 import ./core
 import ./context
 import ./extensions
+import ./middleware
 import ./prompts
 import ./resources
 import ./schema
@@ -43,6 +44,10 @@ type
     taskHandler: McpTaskHandler
     headerBindings: seq[McpHeaderBinding]
 
+  McpToolGroup* = object
+    namespace*: string
+    tools*: seq[McpTool]
+
   McpServer* = ref object
     name: string
     version: string
@@ -70,6 +75,7 @@ type
     promptFilter: McpPromptFilter
     securityLimits: McpSecurityLimits
     observability: McpObservability
+    toolMiddleware: seq[McpToolMiddleware]
     extensions: McpExtensionRegistry
     taskStore: McpTaskStore
 
@@ -94,7 +100,7 @@ proc newMcpServer*(name, version: string, instructions = "",
     toolTimeouts: initTable[string, int](),
     extensions: newMcpExtensionRegistry())
 
-proc resultObject(server: McpServer): McpResult
+proc resultObject(server: McpServer): McpWireResult
 proc closeSubscription*(server: McpServer, subscription: McpSubscription,
                         graceful = true): bool
 proc visibleTool(server: McpServer, name: string,
@@ -155,6 +161,228 @@ template mcpTool*(name, description: string, inputSchema: JsonNode,
   newMcpTool(name, description, inputSchema, handler, outputSchema, title,
     icons, annotations)
 
+proc toolName*(tool: McpTool): string = tool.name
+
+proc mcpTypedResult*[T](value: T): McpToolResult =
+  ## Turn a typed return value into MCP structured content.
+  structuredResult(mcpJsonEncode(value))
+
+proc mcpTypedTypeName(n: NimNode): string =
+  case n.kind
+  of nnkDotExpr: $n[^1]
+  of nnkSym, nnkIdent: n.strVal
+  of nnkBracketExpr:
+    if n.len > 0: mcpTypedTypeName(n[0]) else: ""
+  else: ""
+
+proc mcpTypedTypeInst(n: NimNode): NimNode =
+  if n.kind in {nnkIdent, nnkDotExpr, nnkBracketExpr}: return n
+  try: getTypeInst(n)
+  except CatchableError: n
+
+proc mcpTypedIs(n: NimNode, name: string): bool =
+  if mcpTypedTypeName(n) == name: return true
+  let inst = mcpTypedTypeInst(n)
+  if inst.kind == nnkBracketExpr:
+    return mcpTypedTypeName(inst[0]) == name
+  mcpTypedTypeName(inst) == name
+
+proc mcpTypedIsOption(n: NimNode): bool =
+  let inst = mcpTypedTypeInst(n)
+  inst.kind == nnkBracketExpr and mcpTypedTypeName(inst[0]) == "Option"
+
+proc mcpTypedContextField(n: NimNode): string =
+  for field in ["McpContext", "McpCancellation", "McpProgressReporter",
+                "McpLogger"]:
+    if mcpTypedIs(n, field):
+      case field
+      of "McpContext": return ""
+      of "McpCancellation": return "cancellation"
+      of "McpProgressReporter": return "progress"
+      of "McpLogger": return "logger"
+      else: discard
+  "__not_context__"
+
+proc mcpTypedArgument(n: NimNode, constructor: string): NimNode =
+  let inst = mcpTypedTypeInst(n)
+  if inst.kind != nnkBracketExpr or inst.len != 2 or
+      mcpTypedTypeName(inst[0]) != constructor:
+    return newEmptyNode()
+  inst[1]
+
+proc mcpTypedIsNilNode(n: NimNode): bool =
+  n.isNil or n.kind in {nnkEmpty, nnkNilLit}
+
+proc mcpTypedSignature(handler: NimNode): NimNode =
+  var signature: NimNode
+  if handler.kind == nnkLambda:
+    signature = handler[3]
+  else:
+    let handlerType = mcpTypedTypeInst(handler)
+    if handlerType.kind == nnkProcTy:
+      signature = handlerType[0]
+    else:
+      error("typed MCP tool handler must be an inline proc or a proc value", handler)
+  if signature.kind != nnkFormalParams:
+    error("typed MCP tool handler has no usable signature", handler)
+  signature
+
+proc mcpTypedInputSchema(signature: NimNode): JsonNode =
+  result = %*{
+    "type": "object",
+    "additionalProperties": false,
+    "properties": newJObject(),
+    "required": newJArray()
+  }
+  for index in 1 ..< signature.len:
+    let parameter = signature[index]
+    if parameter.kind != nnkIdentDefs or parameter.len < 3:
+      error("typed MCP tool parameters must be named values", parameter)
+    if parameter[^1].kind != nnkEmpty:
+      error("typed MCP tool parameters must not have Nim defaults; use Option[T]", parameter)
+    let parameterType = parameter[^2]
+    if parameterType.kind in {nnkVarTy, nnkOutTy, nnkStaticTy}:
+      error("typed MCP tool parameters cannot be var, out, or static", parameterType)
+    if mcpTypedContextField(parameterType) != "__not_context__":
+      continue
+    for nameIndex in 0 ..< parameter.len - 2:
+      let name = $parameter[nameIndex]
+      if name.len == 0 or name == "_":
+        error("typed MCP tool argument names must be explicit", parameter[nameIndex])
+      if name in result["properties"]:
+        error("typed MCP tool has duplicate argument " & name, parameter[nameIndex])
+      result["properties"][name] = mcpSchemaFromType(parameterType)
+      if not mcpTypedIsOption(parameterType): result["required"].add %name
+  if result["required"].len == 0: result.delete("required")
+
+proc mcpTypedHandler(handler, signature: NimNode): NimNode =
+  var specialSeen: seq[string]
+  var body = newStmtList()
+  var invocation = newTree(nnkCall, handler)
+  for index in 1 ..< signature.len:
+    let parameter = signature[index]
+    if parameter.kind != nnkIdentDefs or parameter.len < 3:
+      error("typed MCP tool parameters must be named values", parameter)
+    if parameter[^1].kind != nnkEmpty:
+      error("typed MCP tool parameters must not have Nim defaults; use Option[T]", parameter)
+    let parameterType = parameter[^2]
+    for nameIndex in 0 ..< parameter.len - 2:
+      let originalName = $parameter[nameIndex]
+      let contextField = mcpTypedContextField(parameterType)
+      if contextField != "__not_context__":
+        let typeName = mcpTypedTypeName(mcpTypedTypeInst(parameterType))
+        if typeName in specialSeen:
+          error("typed MCP tool may have only one " & typeName &
+            " parameter", parameter)
+        specialSeen.add typeName
+        if contextField.len == 0:
+          invocation.add ident("context")
+        else:
+          invocation.add newTree(nnkDotExpr, ident("context"),
+            ident(contextField))
+      else:
+        if originalName.len == 0 or originalName == "_":
+          error("typed MCP tool argument names must be explicit", parameter[nameIndex])
+        let localName = ident("mcpArg_" & originalName)
+        let decode = newCall(
+          newTree(nnkBracketExpr, bindSym"mcpJsonDecode", parameterType),
+          newCall(bindSym"mcpJsonArgument", ident("arguments"),
+            newLit(originalName)))
+        body.add newTree(nnkLetSection,
+          newIdentDefs(localName, newEmptyNode(), decode))
+        invocation.add localName
+  body.add invocation
+  result = body
+
+macro tool*(server: McpServer, name, description: static[string],
+            handler: typed, inputSchema: untyped = nil,
+            outputSchema: untyped = nil): untyped =
+  ## Register a typed tool; the expansion remains a normal McpTool.
+  try:
+    validateToolName(name)
+  except McpError as error:
+    macros.error("typed MCP tool: " & error.msg, handler)
+  if description.len == 0:
+    error("typed MCP tool description must not be empty", handler)
+  if not mcpTypedIsNilNode(inputSchema):
+    validateMcpSchemaLiteral(inputSchema, "typed MCP inputSchema")
+  if not mcpTypedIsNilNode(outputSchema):
+    validateMcpSchemaLiteral(outputSchema, "typed MCP outputSchema")
+  let signature = mcpTypedSignature(handler)
+  let input = mcpTypedInputSchema(signature)
+  try:
+    validateJsonSchema(input, "typed MCP inputSchema")
+  except McpError as error:
+    macros.error(error.msg, handler)
+  let returnType = signature[0]
+  var outputType = returnType
+  var asynchronous = false
+  if mcpTypedIs(returnType, "Future"):
+    let returnInst = mcpTypedTypeInst(returnType)
+    if returnInst.kind != nnkBracketExpr or returnInst.len != 2:
+      error("typed MCP tool Future return must specify one result type", returnType)
+    outputType = returnInst[1]
+    asynchronous = true
+
+  let wrapperBody = mcpTypedHandler(handler, signature)
+  var body = wrapperBody
+  let invocation = body[^1]
+  var prefix = newStmtList()
+  for index in 0 ..< body.len - 1: prefix.add body[index]
+  body = prefix
+  let completedInvocation = if asynchronous:
+    newTree(nnkCommand, ident("await"), invocation) else: invocation
+  if mcpTypedIs(outputType, "McpToolResult"):
+    body.add newTree(nnkReturnStmt, completedInvocation)
+  elif mcpTypedArgument(outputType, "McpResult").kind != nnkEmpty:
+    body.add newTree(nnkReturnStmt,
+      newCall(bindSym"toMcpToolResult", completedInvocation))
+  elif mcpTypedTypeName(outputType) in ["void", "Void"] or
+      returnType.kind == nnkEmpty:
+    if asynchronous: body.add newTree(nnkDiscardStmt, completedInvocation)
+    body.add newTree(nnkReturnStmt, newCall(bindSym"textResult", newLit("")))
+  else:
+    body.add newTree(nnkReturnStmt,
+      newCall(bindSym"mcpTypedResult", completedInvocation))
+
+  let wrapperReturn = if asynchronous:
+    newTree(nnkBracketExpr, bindSym"Future", bindSym"McpToolResult")
+  else: bindSym"McpToolResult"
+  let wrapperPragmas = if asynchronous:
+    newTree(nnkPragma, ident("async")) else: newEmptyNode()
+  let wrapper = newTree(nnkLambda, newEmptyNode(), newEmptyNode(),
+    newEmptyNode(),
+    newTree(nnkFormalParams, wrapperReturn,
+      newIdentDefs(ident("arguments"), bindSym"JsonNode"),
+      newIdentDefs(ident("context"), bindSym"McpContext")),
+    wrapperPragmas, newEmptyNode(), body)
+  let inputExpr = if mcpTypedIsNilNode(inputSchema):
+    newCall(bindSym"parseJson", newLit($input)) else: inputSchema
+  let typedOutput = mcpTypedArgument(outputType, "McpResult")
+  var outputExpr: NimNode = newNilLit()
+  if not mcpTypedIsNilNode(outputSchema):
+    outputExpr = outputSchema
+  elif not mcpTypedIs(outputType, "McpToolResult") and
+      typedOutput.kind == nnkEmpty and
+      mcpTypedTypeName(outputType) notin ["void", "Void"] and
+      returnType.kind != nnkEmpty:
+    outputExpr = newCall(bindSym"parseJson",
+      newLit($mcpSchemaFromType(outputType)))
+  elif typedOutput.kind != nnkEmpty:
+    outputExpr = newCall(bindSym"parseJson", newLit($mcpSchemaFromType(
+      typedOutput)))
+  if not outputExpr.isNil and outputExpr.kind == nnkCall:
+    if typedOutput.kind != nnkEmpty:
+      try:
+        validateJsonSchema(mcpSchemaFromType(typedOutput),
+          "typed MCP outputSchema")
+      except McpError as error:
+        macros.error(error.msg, handler)
+  result = newCall(ident("addTool"), server,
+    newCall(bindSym"newMcpTool", newLit(name), newLit(description),
+      inputExpr, wrapper, outputExpr))
+  when defined(mcpwireDebugMacros): echo treeRepr(result)
+
 macro mcpServer*(name, version: static[string], body: untyped): untyped =
   ## Build a server declaratively while keeping registration code local.
   let serverIdent = ident("server")
@@ -173,6 +401,61 @@ proc addTool*(server: McpServer, tool: McpTool) =
     if current.name == tool.name:
       raise newMcpError("duplicate tool name: " & tool.name)
   server.tools.add tool
+
+proc addTool*(group: var McpToolGroup, tool: McpTool) =
+  for current in group.tools:
+    if current.name == tool.name:
+      raise newMcpError("duplicate tool name in group: " & tool.name)
+  group.tools.add tool
+
+proc newMcpToolGroup*(namespace = "", tools: seq[McpTool] = @[]): McpToolGroup =
+  if namespace.len > 0: validateToolName(namespace)
+  result.namespace = namespace
+  for tool in tools:
+    result.addTool(tool)
+
+proc namespacedTool(tool: McpTool, namespace: string): McpTool =
+  if namespace.len == 0: return tool
+  result = tool
+  result.name = namespace & "." & tool.name
+  validateToolName(result.name)
+
+proc addToolGroup*(server: McpServer, group: McpToolGroup) =
+  if server.isNil: raise newMcpError("server must not be nil")
+  if server.securityLimits.maxToolCount > 0 and
+      server.tools.len + group.tools.len > server.securityLimits.maxToolCount:
+    raise newMcpError("tool count exceeds the configured limit")
+  var names: seq[string]
+  var registeredTools: seq[McpTool]
+  for tool in group.tools:
+    let registered = tool.namespacedTool(group.namespace)
+    for name in names:
+      if name == registered.name:
+        raise newMcpError("duplicate tool name: " & registered.name)
+    for current in server.tools:
+      if current.name == registered.name:
+        raise newMcpError("duplicate tool name: " & registered.name)
+    names.add registered.name
+    registeredTools.add registered
+  for tool in registeredTools:
+    server.tools.add tool
+
+proc addTools*(server: McpServer, namespace: string,
+               tools: openArray[McpTool]) =
+  var group = newMcpToolGroup(namespace)
+  for tool in tools:
+    group.addTool(tool)
+  server.addToolGroup(group)
+
+proc addTools*(server: McpServer, tools: openArray[McpTool]) =
+  server.addTools("", tools)
+
+proc registerTools*(server: McpServer, namespace: string,
+                    tools: openArray[McpTool]) =
+  server.addTools(namespace, tools)
+
+proc registerToolGroup*(server: McpServer, group: McpToolGroup) =
+  server.addToolGroup(group)
 
 proc resourceNotification(subscription: McpResourceSubscription,
                           methodName, uri: string): JsonNode =
@@ -281,6 +564,15 @@ proc addResourceTemplateCompletion*(server: McpServer, uriTemplate,
   for index in 0 ..< server.resourceTemplates.len:
     if server.resourceTemplates[index].uriTemplate == uriTemplate:
       server.resourceTemplates[index].addCompletion(argument, handler)
+      return
+  raise newMcpError("unknown resource URI template: " & uriTemplate)
+
+proc addResourceTemplateCompletion*(server: McpServer, uriTemplate: string,
+                                    completion: McpCompletion) =
+  if server.isNil: raise newMcpError("server must not be nil")
+  for index in 0 ..< server.resourceTemplates.len:
+    if server.resourceTemplates[index].uriTemplate == uriTemplate:
+      server.resourceTemplates[index].addCompletion(completion)
       return
   raise newMcpError("unknown resource URI template: " & uriTemplate)
 
@@ -435,6 +727,15 @@ proc addPromptCompletion*(server: McpServer, promptName, argument: string,
     raise newMcpError("unknown prompt: " & promptName)
   server.prompts[index].addCompletion(argument, handler)
 
+proc addPromptCompletion*(server: McpServer, promptName: string,
+                          completion: McpCompletion) =
+  if server.isNil: raise newMcpError("server must not be nil")
+  for index in 0 ..< server.prompts.len:
+    if server.prompts[index].name == promptName:
+      server.prompts[index].addCompletion(completion)
+      return
+  raise newMcpError("unknown prompt: " & promptName)
+
 proc addPromptCompletion*(server: McpServer, promptName, argument: string,
                           handler: McpSyncPromptCompletionHandler) =
   if handler.isNil: raise newMcpError("prompt completion handler must not be nil")
@@ -479,7 +780,7 @@ proc serverMeta(server: McpServer): JsonNode =
     "version": server.version
   }}
 
-proc resultObject(server: McpServer): McpResult =
+proc resultObject(server: McpServer): McpWireResult =
   var fields = newJObject()
   fields["_meta"] = serverMeta(server)
   server.extensions.addExtensionMetadata(fields["_meta"])
@@ -496,15 +797,6 @@ proc toolJson(tool: McpTool): JsonNode =
     result["icons"] = tool.icons
   if not tool.annotations.isNil:
     result["annotations"] = tool.annotations
-
-proc resourceJson(resource: McpResource): JsonNode =
-  toJson(resource)
-
-proc resourceTemplateJson(resourceTemplate: McpResourceTemplate): JsonNode =
-  toJson(resourceTemplate)
-
-proc promptJson(prompt: McpPrompt): JsonNode =
-  toJson(prompt)
 
 proc encodeToolsCursor(index: int): string =
   encode("nimwire.tools.list.v1:" & $index)
@@ -536,7 +828,7 @@ proc decodeResourceCursor(cursor, prefix: string, itemCount: int): int =
     raise newMcpError("resource list cursor is out of range")
 
 proc listResources(server: McpServer, params: McpParams,
-                   context: McpContext): McpResult =
+                   context: McpContext): McpWireResult =
   var fields = resultObject(server).fields
   let principal = if context.isNil: nil else: context.principal
   var resources: seq[McpResource]
@@ -557,7 +849,7 @@ proc listResources(server: McpServer, params: McpParams,
     min(resources.len, start + server.listPageSize)
   fields["resources"] = newJArray()
   for index in start ..< finish:
-    fields["resources"].add resourceJson(resources[index])
+    fields["resources"].add toJson(resources[index])
   if finish < resources.len:
     fields["nextCursor"] = %encodeResourceCursor(finish)
   fields["ttlMs"] = %server.listTtlMs
@@ -568,7 +860,7 @@ proc encodeResourceTemplateCursor(index: int): string =
   encode("nimwire.resources.templates.list.v1:" & $index)
 
 proc listResourceTemplates(server: McpServer, params: McpParams,
-                           context: McpContext): McpResult =
+                           context: McpContext): McpWireResult =
   var fields = resultObject(server).fields
   let principal = if context.isNil: nil else: context.principal
   var templates: seq[McpResourceTemplate]
@@ -591,7 +883,7 @@ proc listResourceTemplates(server: McpServer, params: McpParams,
     min(templates.len, start + server.listPageSize)
   fields["resourceTemplates"] = newJArray()
   for index in start ..< finish:
-    fields["resourceTemplates"].add resourceTemplateJson(templates[index])
+    fields["resourceTemplates"].add toJson(templates[index])
   if finish < templates.len:
     fields["nextCursor"] = %encodeResourceTemplateCursor(finish)
   fields["ttlMs"] = %server.listTtlMs
@@ -602,7 +894,7 @@ proc encodePromptCursor(index: int): string =
   encode("nimwire.prompts.list.v1:" & $index)
 
 proc listPrompts(server: McpServer, params: McpParams,
-                 context: McpContext): McpResult =
+                 context: McpContext): McpWireResult =
   var fields = resultObject(server).fields
   let principal = if context.isNil: nil else: context.principal
   var prompts: seq[McpPrompt]
@@ -623,7 +915,7 @@ proc listPrompts(server: McpServer, params: McpParams,
     min(prompts.len, start + server.listPageSize)
   fields["prompts"] = newJArray()
   for index in start ..< finish:
-    fields["prompts"].add promptJson(prompts[index])
+    fields["prompts"].add toJson(prompts[index])
   if finish < prompts.len:
     fields["nextCursor"] = %encodePromptCursor(finish)
   fields["ttlMs"] = %server.listTtlMs
@@ -631,7 +923,7 @@ proc listPrompts(server: McpServer, params: McpParams,
   newMcpResult(mcpComplete, fields)
 
 proc listTools(server: McpServer, params: McpParams,
-               context: McpContext): McpResult =
+               context: McpContext): McpWireResult =
   var fields = resultObject(server).fields
   let principal = if context.isNil: nil else: context.principal
   var tools: seq[McpTool]
@@ -658,7 +950,7 @@ proc listTools(server: McpServer, params: McpParams,
   fields["cacheScope"] = %server.listCacheScope
   newMcpResult(mcpComplete, fields)
 
-proc discover(server: McpServer): McpResult =
+proc discover(server: McpServer): McpWireResult =
   var fields = resultObject(server).fields
   fields["supportedVersions"] = %*[mcpProtocolVersion]
   fields["capabilities"] = %*{"tools": {
@@ -721,6 +1013,19 @@ proc setSecurityLimits*(server: McpServer, limits: McpSecurityLimits) =
 proc setObservability*(server: McpServer, hooks: McpObservability) =
   if server.isNil: raise newMcpError("server must not be nil")
   server.observability = hooks
+
+proc use*(server: McpServer, middleware: McpToolMiddleware) =
+  if server.isNil: raise newMcpError("server must not be nil")
+  if middleware.isNil: raise newMcpError("tool middleware must not be nil")
+  server.toolMiddleware.add middleware
+
+proc use*(server: McpServer,
+          middlewares: openArray[McpToolMiddleware]) =
+  for middleware in middlewares:
+    server.use(middleware)
+
+proc addMiddleware*(server: McpServer, middleware: McpToolMiddleware) =
+  server.use(middleware)
 
 proc registerExtension*(server: McpServer, extension: McpExtension) =
   if server.isNil: raise newMcpError("server must not be nil")
@@ -795,7 +1100,7 @@ iterator toolHeaderBindings*(server: McpServer,
       yield binding
 
 proc callTool(server: McpServer, params: McpParams,
-              context: McpContext): Future[McpResult] {.async.} =
+              context: McpContext): Future[McpWireResult] {.async.} =
   context.checkCancelled()
   let name = requiredString(params.values, "name", "tools/call params")
   let arguments = if "arguments" in params.values:
@@ -806,9 +1111,9 @@ proc callTool(server: McpServer, params: McpParams,
   let principal = if context.isNil: nil else: context.principal
   if index < 0 or not server.visibleTool(name, principal):
     raise newMcpError("unknown tool: " & name)
-  validateJsonValue(server.tools[index].inputSchema, arguments,
-    "tool '" & name & "' arguments")
   if not server.tools[index].taskHandler.isNil:
+    validateJsonValue(server.tools[index].inputSchema, arguments,
+      "tool '" & name & "' arguments")
     if server.taskStore.isNil:
       raise newMcpError("tasks extension is not enabled", mcpMethodNotFoundCode)
     context.requireClientExtension(mcpTasksExtensionName)
@@ -823,11 +1128,16 @@ proc callTool(server: McpServer, params: McpParams,
     context.deadlineAt = epochTime() + timeout.float / 1000.0
   var output: McpToolResult
   try:
-    let handler = server.tools[index].handler(arguments, context)
-    if timeout > 0 and not await withTimeout(handler, timeout):
-      context.cancel("tool deadline exceeded")
-      raise newMcpError("MCP tool request timed out", mcpInternalErrorCode)
-    output = await handler
+    let terminal: McpToolNext = proc (): Future[McpToolResult] {.async.} =
+      validateJsonValue(server.tools[index].inputSchema, arguments,
+        "tool '" & name & "' arguments")
+      let handler = server.tools[index].handler(arguments, context)
+      if timeout > 0 and not await withTimeout(handler, timeout):
+        context.cancel("tool deadline exceeded")
+        raise newMcpError("MCP tool request timed out", mcpInternalErrorCode)
+      await handler
+    output = await runMcpToolMiddleware(server.toolMiddleware, 0, name,
+      arguments, context, terminal)
     context.checkCancelled()
   finally:
     context.deadlineAt = previousDeadline
@@ -858,7 +1168,7 @@ proc callTool(server: McpServer, params: McpParams,
   newMcpResult(mcpComplete, fields)
 
 proc readResourceRequest(server: McpServer, params: McpParams,
-                         context: McpContext): Future[McpResult] {.async.} =
+                         context: McpContext): Future[McpWireResult] {.async.} =
   let uri = requiredString(params.values, "uri", "resources/read params")
   validateResourceUri(uri, "resources/read")
   var contents: seq[McpResourceContent]
@@ -898,7 +1208,7 @@ proc readResourceRequest(server: McpServer, params: McpParams,
   newMcpResult(mcpComplete, fields)
 
 proc getPromptRequest(server: McpServer, params: McpParams,
-                      context: McpContext): Future[McpResult] {.async.} =
+                      context: McpContext): Future[McpWireResult] {.async.} =
   let name = requiredString(params.values, "name", "prompts/get params")
   let index = server.findPrompt(name)
   let principal = if context.isNil: nil else: context.principal
@@ -931,7 +1241,7 @@ proc completionArguments(value: JsonNode, label: string): JsonNode =
       raise newMcpError(label & " argument '" & name & "' must be a string")
   value
 
-proc completionResult(server: McpServer, values: seq[string]): McpResult =
+proc completionResult(server: McpServer, values: seq[string]): McpWireResult =
   var completion = %*{
     "values": newJArray(),
     "total": values.len,
@@ -945,7 +1255,7 @@ proc completionResult(server: McpServer, values: seq[string]): McpResult =
   newMcpResult(mcpComplete, fields)
 
 proc completeRequest(server: McpServer, params: McpParams,
-                     context: McpContext): Future[McpResult] {.async.} =
+                     context: McpContext): Future[McpWireResult] {.async.} =
   if "ref" notin params.values:
     raise newMcpError("completion/complete requires 'ref'")
   if "argument" notin params.values:
@@ -1038,7 +1348,7 @@ proc validateRoundTripRequest(server: McpServer, request: McpRpcRequest,
   discard context.verifyRequestState()
 
 proc dispatchAsync*(server: McpServer, request: McpRpcRequest,
-                    context: McpContext): Future[McpResult] {.async.} =
+                    context: McpContext): Future[McpWireResult] {.async.} =
   context.checkCancelled()
   case request.methodName
   of "server/discover":

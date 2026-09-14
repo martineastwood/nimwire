@@ -27,6 +27,8 @@ Streamable HTTP:
   optional OpenTelemetry-friendly span hooks;
 - opt-in MCP Tasks with durable-store hooks, polling, input updates, and
   cancellation;
+- transport-neutral typed message handling, linked in-process transports, and
+  collision-safe remote server composition;
 - generic finalized extension registration with capability negotiation and
   schema-validated methods;
 - sync and async tool handlers;
@@ -40,8 +42,13 @@ prompt definitions and messages, and
 request-scoped handler context, `nimwire/mrtr` provides multi-round-trip input
 handling, `nimwire/auth` provides HTTP authorization hooks, `nimwire/security`
 provides reusable limits and redaction, while `nimwire/testing` provides
-in-process request helpers. `nimwire/tasks` adds the opt-in Tasks extension and
-`nimwire/extensions` adds generic extension registration.
+in-process request helpers. `nimwire/transport` defines the generic typed
+message transport and `McpPeer` request/response helper, while
+`nimwire/transports/inproc` links a server without a process or socket.
+`nimwire/composition` mounts a discovered remote peer's tools, resources, and
+prompts under a required namespace. `nimwire/tasks` adds the opt-in Tasks
+extension and `nimwire/extensions` adds generic extension registration.
+`nimwire/middleware` contains composable tool middleware helpers.
 
 Use `parseMcpMessage` and `toJson` at custom transport boundaries. The parser
 enforces a 1 MiB message limit and 64 levels of nesting by default; both are
@@ -68,7 +75,7 @@ framework. `newMcpHttpServer` also provides a small stdlib
 `asynchttpserver` adapter. See [examples/reverse_proxy.conf](examples/reverse_proxy.conf)
 for a minimal deployment shape.
 
-Every tool handler receives request context as its second parameter. Use an
+Raw tool handlers receive request context as their second parameter. Use an
 ignored parameter when a tool does not need it:
 
 ```nim
@@ -76,6 +83,30 @@ server.addTool mcpTool("whoami", "Read the caller", %*{"type": "object"},
   proc (args: JsonNode, context: McpContext): McpToolResult =
     textResult(context.principal.subject))
 ```
+
+For typed tools, `server.tool` derives the MCP input and output schemas and
+generates JSON decoding/encoding at compile time:
+
+```nim
+type Weather = object
+  temperature*: int
+  condition*: string
+
+server.tool "weather", "Current weather",
+  proc (city: string): Weather = lookupWeather(city)
+```
+
+Typed handlers may receive `McpContext`, `McpCancellation`,
+`McpProgressReporter`, or `McpLogger` parameters, and may return a `Future[T]`,
+`McpToolResult`, or typed `McpResult[T]`. Use `mcpResult(value)` for success and
+`mcpResultError[T](code, message, details)` for typed failures. `Option`, enums,
+objects, sequences, tables, and nested combinations are supported. Pass `inputSchema = ...` or
+`outputSchema = ...` to override inference when a wire schema needs more
+detail. `mcpJsonSchema(MyType)` is available when a schema needs to be reused.
+Use `-d:mcpwireDebugMacros` to print the generated registration code.
+
+The low-level protocol envelope is `McpWireResult`; typed tool handlers should
+use `McpResult[T]` or `McpToolResult`.
 
 `McpStateStore` provides expiring, subject-bound opaque handles when a workflow
 needs to carry state across otherwise stateless requests.
@@ -98,7 +129,9 @@ server.addResource newFileResource(getCurrentDir(), "README.md",
   uriValue = "file:///project/README.md", mimeType = "text/markdown")
 ```
 
-Use `newMcpResourceTemplate` for parameterized resources and
+`mcpResource`, `mcpResourceTemplate`, `mcpPrompt`, and `mcpCompletion` provide
+the same concise declaration style for the other features. Use
+`newMcpResourceTemplate` for parameterized resources and
 `newFileResourceTemplate` for confined file access. `safeResourcePath` rejects
 traversal and symlink escapes before a file is read. See
 `examples/resources_server.nim` for file, generated-data, database-schema,
@@ -139,6 +172,28 @@ notification through the transport's notification sender. Set
 or `server.cancelActiveRequests` during shutdown. HTTP adapters should call
 `request.cancellation.cancel("client disconnected")` when their framework
 reports a closed request stream.
+
+Compose tool middleware with `server.use`. Built-ins include
+`mcpAuthMiddleware`, `mcpValidationMiddleware`, `mcpTimingMiddleware`,
+`mcpRetryMiddleware`, `mcpPolicyMiddleware`, and `mcpApprovalMiddleware`.
+Use `newMcpToolGroup`, `addToolGroup`, or `addTools(namespace, tools)` for
+grouped registration. Discovery is sorted by final tool name regardless of
+registration order.
+
+Use the transport-neutral peer for clients or composition:
+
+```nim
+let upstream = newMcpServer("upstream", "1.0.0")
+let local = newMcpServer("local", "1.0.0")
+discard local.mountMcpServer(newMcpInProcessTransport(upstream), "upstream")
+```
+
+`McpMessageTransport` carries typed JSON-RPC messages and has no server or
+transport dependency, so nimgent can adapt stdio, HTTP, or another client
+implementation to it. `mountMcpServer` discovers paginated tools, resources,
+templates, prompts, and completions, then exposes them as namespaced local
+features. Tool, prompt, resource, and URI-template collisions are rejected
+before registration; resource URIs are encoded under the namespace.
 
 Enable long-running tools with `server.enableTasks()` and
 `newMcpTaskTool`. The server advertises `io.modelcontextprotocol/tasks` only

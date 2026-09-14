@@ -1,6 +1,6 @@
 ## Lightweight JSON Schema validation for tool boundaries.
 
-import std/[json, strutils, unicode]
+import std/[json, jsonutils, macros, strutils, unicode]
 
 import ./core
 
@@ -119,8 +119,9 @@ proc validateSchemaArray(node: JsonNode, key, path: string) =
   if key notin node: return
   if node[key].kind != JArray or node[key].len == 0:
     raise schemaFailure(path, key & " must be a non-empty array")
-  for index, value in node[key].pairs:
-    validateSchemaNode(value, path & "." & key & "[" & $index & "]")
+  for index in 0 ..< node[key].len:
+    validateSchemaNode(node[key][index], path & "." & key & "[" &
+      $index & "]")
 
 proc validateSchemaNode(node: JsonNode, path: string) =
   if node.kind == JBool: return
@@ -162,13 +163,13 @@ proc validateSchemaNode(node: JsonNode, path: string) =
   if "prefixItems" in schema:
     if schema["prefixItems"].kind != JArray:
       raise schemaFailure(path, "prefixItems must be an array")
-    for index, value in schema["prefixItems"].pairs:
-      validateSchemaNode(value, path & ".prefixItems[" & $index & "]")
+    for index in 0 ..< schema["prefixItems"].len:
+      validateSchemaNode(schema["prefixItems"][index],
+        path & ".prefixItems[" & $index & "]")
   for key in ["allOf", "anyOf", "oneOf"]:
     validateSchemaArray(schema, key, path)
-  for key in ["not"]:
-    if key in schema:
-      validateSchemaNode(schema[key], path & "." & key)
+  if "not" in schema:
+    validateSchemaNode(schema["not"], path & ".not")
   if "enum" in schema and
       (schema["enum"].kind != JArray or schema["enum"].len == 0):
     raise schemaFailure(path, "enum must be a non-empty array")
@@ -184,6 +185,60 @@ proc validateSchemaNode(node: JsonNode, path: string) =
 
 proc validateJsonSchema*(schema: JsonNode, context = "JSON Schema") =
   validateSchemaNode(schema, context)
+
+proc mcpLiteralJson*(node: NimNode): JsonNode =
+  ## Evaluate the literal subset used by `%*` without executing user code.
+  ## A nil result means that the expression is dynamic and will be checked at
+  ## registration time instead.
+  if node.isNil: return nil
+  case node.kind
+  of nnkPrefix:
+    if node.len == 2 and $node[0] == "%*":
+      return mcpLiteralJson(node[1])
+    if node.len == 2 and $node[0] == "-":
+      let value = mcpLiteralJson(node[1])
+      if value.isNil: return nil
+      case value.kind
+      of JInt: return %(-value.getInt)
+      of JFloat: return %(-value.getFloat)
+      else: return nil
+    return nil
+  of nnkTableConstr:
+    result = newJObject()
+    for entry in node:
+      if entry.kind != nnkExprColonExpr: return nil
+      let key = case entry[0].kind
+        of nnkStrLit, nnkRStrLit: entry[0].strVal
+        of nnkIdent: entry[0].strVal
+        else: return nil
+      let value = mcpLiteralJson(entry[1])
+      if value.isNil: return nil
+      result[key] = value
+  of nnkBracket:
+    result = newJArray()
+    for item in node:
+      let value = mcpLiteralJson(item)
+      if value.isNil: return nil
+      result.add value
+  of nnkStrLit, nnkRStrLit, nnkTripleStrLit: return %node.strVal
+  of nnkIntLit: return %node.intVal
+  of nnkFloatLit: return %node.floatVal
+  of nnkNilLit: return newJNull()
+  of nnkIdent:
+    case node.strVal
+    of "true": return %true
+    of "false": return %false
+    of "nil": return newJNull()
+    else: return nil
+  else: return nil
+
+proc validateMcpSchemaLiteral*(node: NimNode, context: string) =
+  let schema = mcpLiteralJson(node)
+  if schema.isNil: return
+  try:
+    discard requireJsonSchema(schema, context)
+  except McpError as error:
+    macros.error(context & ": " & error.msg, node)
 
 proc validateToolName*(name: string) =
   if name.len < 1 or name.len > 128:
@@ -214,6 +269,146 @@ proc validateToolPresentation*(icons, annotations: JsonNode) =
         raise newMcpError("tool icon theme must be a string")
   if not annotations.isNil and annotations.kind != JObject:
     raise newMcpError("tool annotations must be an object")
+
+proc mcpSchemaTypeName(n: NimNode): string =
+  case n.kind
+  of nnkDotExpr: $n[^1]
+  of nnkSym, nnkIdent: n.strVal
+  else: $n
+
+proc mcpSchemaTypeInst(n: NimNode): NimNode =
+  if n.kind in {nnkIdent, nnkDotExpr, nnkBracketExpr}: return n
+  try: getTypeInst(n)
+  except CatchableError: n
+
+proc mcpSchemaUnwrapType(n: NimNode): NimNode =
+  result = n
+  var impl = getTypeImpl(result)
+  if impl.kind == nnkBracketExpr and impl.len > 1:
+    result = impl[1]
+    impl = getTypeImpl(result)
+  if impl.kind == nnkRefTy or impl.kind == nnkDistinctTy:
+    result = impl[0]
+
+proc mcpSchemaTypeIsOption(n: NimNode): bool =
+  let inst = mcpSchemaTypeInst(n)
+  inst.kind == nnkBracketExpr and mcpSchemaTypeName(inst[0]) == "Option"
+
+proc mcpSchemaFromType*(n: NimNode): JsonNode
+
+proc mcpSchemaOption(inner: JsonNode): JsonNode =
+  %*{"anyOf": [inner, {"type": "null"}]}
+
+proc mcpSchemaFieldName(n: NimNode): string =
+  var field = n
+  if field.kind == nnkPragmaExpr: field = field[0]
+  if field.kind == nnkPostfix: field = field[1]
+  mcpSchemaTypeName(field)
+
+proc mcpSchemaAddFields(schema: JsonNode, record: NimNode) =
+  case record.kind
+  of nnkRecList:
+    for field in record:
+      if field.kind != nnkIdentDefs or field.len < 3: continue
+      let fieldType = field[^2]
+      for index in 0 ..< field.len - 2:
+        let name = mcpSchemaFieldName(field[index])
+        if name.len == 0:
+          error("jsonSchema: object field name must not be empty", field[index])
+        if name in schema["properties"]:
+          error("jsonSchema: duplicate object field " & name, field[index])
+        schema["properties"][name] = mcpSchemaFromType(fieldType)
+        if not mcpSchemaTypeIsOption(fieldType): schema["required"].add %name
+  of nnkRecCase:
+    if record.len > 0 and record[0].kind == nnkIdentDefs:
+      mcpSchemaAddFields(schema, newTree(nnkRecList, record[0]))
+    for index in 1 ..< record.len:
+      mcpSchemaAddFields(schema, record[index])
+  of nnkOfBranch, nnkElifBranch, nnkElse:
+    if record.len > 0: mcpSchemaAddFields(schema, record[^1])
+  else: discard
+
+proc mcpSchemaObject(n: NimNode, impl: NimNode): JsonNode =
+  result = %*{
+    "type": "object",
+    "additionalProperties": false,
+    "properties": newJObject(),
+    "required": newJArray()
+  }
+  var source = impl
+  try:
+    let definition = getImpl(n)
+    if definition.kind == nnkTypeDef and definition.len > 0:
+      source = definition[^1]
+  except CatchableError:
+    discard
+  let record = if source.kind == nnkObjectTy and source.len > 2:
+    source[2] else: (if impl.len > 2: impl[2] else: newEmptyNode())
+  mcpSchemaAddFields(result, record)
+  if result["required"].len == 0: result.delete("required")
+
+proc mcpSchemaFromType*(n: NimNode): JsonNode =
+  let inst = mcpSchemaTypeInst(n)
+  if inst.kind == nnkBracketExpr:
+    let constructor = mcpSchemaTypeName(inst[0])
+    if constructor in ["seq", "openArray"]:
+      return %*{"type": "array", "items": mcpSchemaFromType(inst[1])}
+    if constructor == "array" and inst.len >= 3:
+      return %*{"type": "array", "items": mcpSchemaFromType(inst[^1])}
+    if constructor in ["Table", "OrderedTable"]:
+      if inst.len < 3 or mcpSchemaTypeName(inst[1]) notin ["string", "cstring"]:
+        error("jsonSchema: Table keys must be string or cstring", n)
+      return %*{"type": "object",
+                "additionalProperties": mcpSchemaFromType(inst[2])}
+    if constructor == "Option":
+      if inst.len != 2: error("jsonSchema: Option requires one type", n)
+      return mcpSchemaOption(mcpSchemaFromType(inst[1]))
+
+  let core = mcpSchemaUnwrapType(n)
+  let impl = getTypeImpl(core)
+  case impl.kind
+  of nnkObjectTy:
+    return mcpSchemaObject(core, impl)
+  of nnkEnumTy:
+    var values = newJArray()
+    for index in 1 ..< impl.len:
+      case impl[index].kind
+      of nnkEnumFieldDef:
+        if impl[index][1].kind in {nnkStrLit, nnkRStrLit}:
+          values.add %impl[index][1].strVal
+        else: values.add %mcpSchemaTypeName(impl[index][0])
+      of nnkSym: values.add %mcpSchemaTypeName(impl[index])
+      else: discard
+    return %*{"type": "string", "enum": values}
+  else: discard
+
+  let name = mcpSchemaTypeName(mcpSchemaTypeInst(core))
+  case name
+  of "string", "cstring": %*{"type": "string"}
+  of "bool": %*{"type": "boolean"}
+  of "int", "int8", "int16", "int32", "int64", "uint", "uint8",
+     "uint16", "uint32", "uint64", "byte": %*{"type": "integer"}
+  of "float", "float32", "float64": %*{"type": "number"}
+  of "JsonNode": %*{}
+  else:
+    error("jsonSchema: unsupported type " & name, n)
+
+macro mcpJsonSchema*(T: typedesc): JsonNode =
+  ## Derive a JSON Schema for primitives, objects, enums, containers, tables,
+  ## options, and nested combinations of those types.
+  let schema = mcpSchemaFromType(T)
+  result = newCall(bindSym"parseJson", newLit($schema))
+
+proc mcpJsonArgument*(arguments: JsonNode, name: string): JsonNode =
+  if arguments.hasKey(name): arguments[name] else: newJNull()
+
+proc mcpJsonDecode*[T](value: JsonNode): T =
+  ## Decode typed tool arguments while allowing absent Option properties.
+  jsonTo(value, T, Joptions(allowMissingKeys: true))
+
+proc mcpJsonEncode*[T](value: T): JsonNode =
+  ## Encode typed results with stable, model-facing enum names.
+  toJson(value, ToJsonOptions(enumMode: joptEnumString))
 
 proc jsonType(node: JsonNode): string =
   case node.kind

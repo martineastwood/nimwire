@@ -19,7 +19,7 @@ type
     mcpTaskCancelled
 
   McpTaskHandler* = proc (arguments: JsonNode,
-                          context: McpContext): Future[McpResult] {.closure.}
+                          context: McpContext): Future[McpWireResult] {.closure.}
   McpTaskCreateProc* = proc (task: McpTask) {.closure.}
   McpTaskGetProc* = proc (taskId, subject: string): McpTask {.closure.}
   McpTaskUpdateProc* = proc (task: McpTask) {.closure.}
@@ -37,7 +37,7 @@ type
     total*: float
     hasTotal*: bool
     inputRequests*: JsonNode
-    result*: McpResult
+    result*: McpWireResult
     hasResult*: bool
     error*: McpRpcError
     hasError*: bool
@@ -136,7 +136,7 @@ proc taskOwner(context: McpContext): string =
   if not context.isNil and not context.principal.isNil:
     return context.principal.subject
 
-proc newMcpTaskResult*(task: McpTask): McpResult =
+proc newMcpTaskResult*(task: McpTask): McpWireResult =
   if task.isNil: raise newMcpError("task must not be nil")
   var fields = %*{
     "taskId": task.taskId,
@@ -159,7 +159,7 @@ proc newMcpTaskResult*(task: McpTask): McpResult =
     fields["error"] = toJson(task.error)
   newMcpResult(mcpTask, fields)
 
-proc newMcpTaskGetResult*(task: McpTask): McpResult =
+proc newMcpTaskGetResult*(task: McpTask): McpWireResult =
   if task.isNil: raise newMcpError("task not found")
   newMcpResult(mcpComplete, newMcpTaskResult(task).fields)
 
@@ -304,18 +304,18 @@ proc newMcpTasksExtension*(store: McpTaskStore): McpExtension =
   result = newMcpExtension(mcpTasksExtensionName,
     requiresClientCapability = true)
   result.addExtensionMethod("tasks/get",
-    proc (params: JsonNode, context: McpContext): Future[McpResult] {.async.} =
+    proc (params: JsonNode, context: McpContext): Future[McpWireResult] {.async.} =
       let taskId = requiredString(params, "taskId", "tasks/get params")
       store.getMcpTask(taskId, context).newMcpTaskGetResult())
   result.addExtensionMethod("tasks/update",
-    proc (params: JsonNode, context: McpContext): Future[McpResult] {.async.} =
+    proc (params: JsonNode, context: McpContext): Future[McpWireResult] {.async.} =
       let taskId = requiredString(params, "taskId", "tasks/update params")
       if "inputResponses" notin params:
         raise newMcpError("tasks/update requires inputResponses")
       store.updateMcpTask(taskId, params["inputResponses"], context)
       newMcpResult(mcpComplete))
   result.addExtensionMethod("tasks/cancel",
-    proc (params: JsonNode, context: McpContext): Future[McpResult] {.async.} =
+    proc (params: JsonNode, context: McpContext): Future[McpWireResult] {.async.} =
       let taskId = requiredString(params, "taskId", "tasks/cancel params")
       store.cancelMcpTask(taskId, context)
       newMcpResult(mcpComplete))

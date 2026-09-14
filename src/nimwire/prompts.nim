@@ -41,6 +41,13 @@ type
                                           context: McpContext):
                                           seq[string] {.closure.}
 
+  McpCompletionHandler* = proc (argument, prefix: string,
+                                context: McpContext):
+                                Future[seq[string]] {.closure.}
+  McpCompletion* = object
+    argument*: string
+    handler*: McpCompletionHandler
+
   McpPrompt* = object
     name*: string
     title*: string
@@ -206,6 +213,26 @@ proc newMcpPrompt*(name, description: string,
                    icons: JsonNode = nil): McpPrompt =
   newMcpPrompt(name, handler, title, description, arguments, icons)
 
+proc newMcpCompletion*(argument: string,
+                       handler: McpCompletionHandler): McpCompletion =
+  if argument.len == 0:
+    raise invalidPrompt("completion argument must not be empty")
+  if handler.isNil:
+    raise invalidPrompt("completion handler must not be nil")
+  McpCompletion(argument: argument, handler: handler)
+
+proc newMcpCompletion*(argument: string,
+                       handler: McpSyncPromptCompletionHandler): McpCompletion =
+  if handler.isNil:
+    raise invalidPrompt("completion handler must not be nil")
+  newMcpCompletion(argument,
+    proc (name, prefix: string, context: McpContext):
+        Future[seq[string]] {.async.} = handler(name, prefix, context))
+
+template mcpCompletion*(argument: string, handler: untyped): McpCompletion =
+  ## Reusable prompt/resource-template completion declaration.
+  newMcpCompletion(argument, handler)
+
 proc newMcpPrompt*(name, description: string,
                    arguments: seq[McpPromptArgument],
                    handler: McpSyncPromptHandler, title = "",
@@ -232,6 +259,9 @@ proc addCompletion*(prompt: var McpPrompt, argument: string,
   if handler.isNil:
     raise invalidPrompt("prompt completion handler must not be nil")
   prompt.completions[argument] = handler
+
+proc addCompletion*(prompt: var McpPrompt, completion: McpCompletion) =
+  prompt.addCompletion(completion.argument, completion.handler)
 
 proc addCompletion*(prompt: var McpPrompt, argument: string,
                     handler: McpSyncPromptCompletionHandler) =

@@ -4,6 +4,7 @@ import std/[asyncdispatch, base64, json, os, tables, strutils, unicode, uri]
 
 import ./context
 import ./core
+import ./prompts
 
 type
   McpResourceContentKind* = enum
@@ -284,7 +285,7 @@ proc newMcpResourceTemplate*(uriTemplate, name: string,
                             handler: McpResourceTemplateReadHandler,
                             title = "", description = "",
                             icons: JsonNode = nil, mimeType = "",
-                            annotations: JsonNode = nil): McpResourceTemplate =
+    annotations: JsonNode = nil): McpResourceTemplate =
   validateUriTemplate(uriTemplate)
   if name.len == 0:
     raise invalidResource("resource template name must not be empty")
@@ -358,6 +359,22 @@ proc newMcpResourceTemplate*(uriTemplate, name: string,
       @[handler(uri, arguments, context)],
     title, description, icons, mimeType, annotations)
 
+template mcpResource*(uri, name: string, value: untyped, title = "",
+                      description = "", icons: JsonNode = nil,
+                      mimeType = "", size: int64 = -1,
+                      annotations: JsonNode = nil): McpResource =
+  ## Concise static or handler-backed resource declaration.
+  newMcpResource(uri, name, value, title, description, icons, mimeType, size,
+    annotations)
+
+template mcpResourceTemplate*(uriTemplate, name: string, handler: untyped,
+                              title = "", description = "",
+                              icons: JsonNode = nil, mimeType = "",
+                              annotations: JsonNode = nil): McpResourceTemplate =
+  ## Concise URI-template resource declaration.
+  newMcpResourceTemplate(uriTemplate, name, handler, title, description, icons,
+    mimeType, annotations)
+
 proc addCompletion*(resourceTemplate: var McpResourceTemplate, argument: string,
                     handler: McpResourceCompletionHandler) =
   if argument notin resourceTemplateVariables(resourceTemplate.uriTemplate):
@@ -365,6 +382,10 @@ proc addCompletion*(resourceTemplate: var McpResourceTemplate, argument: string,
   if handler.isNil:
     raise invalidResource("resource completion handler must not be nil")
   resourceTemplate.completionHandlers[argument] = handler
+
+proc addCompletion*(resourceTemplate: var McpResourceTemplate,
+                    completion: McpCompletion) =
+  resourceTemplate.addCompletion(completion.argument, completion.handler)
 
 proc addCompletion*(resourceTemplate: var McpResourceTemplate, argument: string,
                     handler: McpSyncResourceCompletionHandler) =

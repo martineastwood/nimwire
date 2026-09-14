@@ -1,6 +1,6 @@
 ## Typed protocol values and JSON-RPC validation.
 
-import std/[json, strutils]
+import std/[json, jsonutils, strutils]
 
 const
   mcpProtocolVersion* = "2026-07-28"
@@ -30,6 +30,7 @@ type
   McpError* = object of CatchableError
     code*: int
     data*: JsonNode
+    retryable*: bool
 
   McpIdKind* = enum
     mcpStringId
@@ -99,10 +100,26 @@ type
     mcpInputRequired
     mcpTask
 
-  McpResult* = object
+  ## The protocol result envelope. Handler-facing typed results use
+  ## `McpResult[T]` below.
+  McpWireResult* = object
     resultType*: McpResultType
     ## Result fields are method-specific and retained for forward compatibility.
     fields*: JsonNode
+
+  McpTypedError* = object
+    code*: string
+    message*: string
+    details*: JsonNode
+    retryable*: bool
+
+  McpResult*[T] = object
+    ## A typed handler result. It is converted to `McpToolResult` at the wire
+    ## boundary and never leaks protocol-specific fields into application code.
+    value*: T
+    isError*: bool
+    error*: McpTypedError
+    hasError*: bool
 
   McpRpcError* = object
     code*: int
@@ -126,7 +143,7 @@ type
 
   McpRpcResponse* = object
     id*: McpId
-    result*: McpResult
+    result*: McpWireResult
     extraFields*: JsonNode
 
   McpRpcErrorResponse* = object
@@ -154,12 +171,37 @@ type
     content*: JsonNode
     structuredContent*: JsonNode
     isError*: bool
+    retryable*: bool
 
 proc newMcpError*(message: string, code = mcpInvalidParamsCode,
                   data: JsonNode = nil): ref McpError =
   result = newException(McpError, message)
   result.code = code
   result.data = data
+
+proc retryableMcpError*(message: string, code = mcpInternalErrorCode,
+                        data: JsonNode = nil): ref McpError =
+  result = newMcpError(message, code, data)
+  result.retryable = true
+
+proc mcpResult*[T](value: T): McpResult[T] =
+  McpResult[T](value: value)
+
+proc mcpResultError*[T](code, message: string, details: JsonNode = nil,
+                        retryable = false): McpResult[T] =
+  if code.len == 0 or message.len == 0:
+    raise newMcpError("typed result errors require a code and message")
+  McpResult[T](isError: true,
+    error: McpTypedError(code: code, message: message, details: details,
+      retryable: retryable), hasError: true)
+
+proc mcpError*[T](code, message: string, details: JsonNode = nil,
+                  retryable = false): McpResult[T] =
+  mcpResultError[T](code, message, details, retryable)
+
+proc mcpFailure*[T](message: string, details: JsonNode = nil,
+                    retryable = false): McpResult[T] =
+  mcpResultError[T]("tool_error", message, details, retryable)
 
 proc invalidRequest(message: string): ref McpError =
   newMcpError(message, mcpInvalidRequestCode)
@@ -190,10 +232,8 @@ proc copyObject(node: JsonNode): JsonNode =
     result[key] = value
 
 proc withoutKey(node: JsonNode, excluded: string): JsonNode =
-  result = newJObject()
-  for key, value in node.pairs:
-    if key != excluded:
-      result[key] = value
+  result = copyObject(node)
+  result.delete(excluded)
 
 proc parseMcpId*(node: JsonNode, allowNull = false): McpId =
   if node.isNil:
@@ -274,12 +314,12 @@ proc validateResultFields(resultType: McpResultType, fields: JsonNode) =
       raise invalidRequest("input_required result requires inputRequests or requestState")
 
 proc newMcpResult*(resultType: McpResultType,
-                   fields: JsonNode = nil): McpResult =
+                   fields: JsonNode = nil): McpWireResult =
   result.resultType = resultType
   result.fields = if fields.isNil: newJObject() else: fields
   validateResultFields(resultType, result.fields)
 
-proc parseMcpResult*(node: JsonNode): McpResult =
+proc parseMcpResult*(node: JsonNode): McpWireResult =
   let value = requireProtocolObject(node, "JSON-RPC result")
   if "resultType" notin value or value["resultType"].kind != JString:
     raise invalidRequest("JSON-RPC result requires a string resultType")
@@ -287,7 +327,7 @@ proc parseMcpResult*(node: JsonNode): McpResult =
   result.fields = withoutKey(value, "resultType")
   validateResultFields(result.resultType, result.fields)
 
-proc toJson*(value: McpResult): JsonNode =
+proc toJson*(value: McpWireResult): JsonNode =
   result = copyObject(value.fields)
   result["resultType"] = %value.resultType.resultTypeName
 
@@ -608,7 +648,7 @@ proc parseMcpMessage*(payload: string,
     raise parseError("parse error: " & error.msg)
   parseMcpMessage(node, maxNestingDepth)
 
-proc successResponse*(id: McpId, value: McpResult): McpJsonRpcMessage =
+proc successResponse*(id: McpId, value: McpWireResult): McpJsonRpcMessage =
   McpJsonRpcMessage(kind: mcpResponseMessage,
     response: McpRpcResponse(id: id, result: value, extraFields: newJObject()))
 
@@ -723,7 +763,32 @@ proc newMcpToolResult*(content: JsonNode,
   if content.isNil or content.kind != JArray:
     raise newMcpError("tool result content must be an array")
   McpToolResult(content: content, structuredContent: structuredContent,
-    isError: isError)
+    isError: isError, retryable: false)
 
 proc structuredResult*(value: JsonNode, isError = false): McpToolResult =
   jsonResult(value, isError)
+
+proc typedResultJson*[T](value: T): JsonNode =
+  when T is JsonNode:
+    if value.isNil: newJNull() else: value
+  else:
+    toJson(value, ToJsonOptions(enumMode: joptEnumString))
+
+proc toMcpToolResult*[T](value: McpResult[T]): McpToolResult =
+  if value.isError:
+    let message = if value.hasError: value.error.message else: "typed tool failed"
+    result = textResult(message, isError = true)
+    result.retryable = value.hasError and value.error.retryable
+    return
+  structuredResult(typedResultJson(value.value))
+
+proc toJson*[T](value: McpResult[T]): JsonNode =
+  if value.isError:
+    result = %*{"isError": true}
+    if value.hasError:
+      result["error"] = %*{"code": value.error.code,
+        "message": value.error.message}
+      if not value.error.details.isNil:
+        result["error"]["details"] = value.error.details
+  else:
+    typedResultJson(value.value)

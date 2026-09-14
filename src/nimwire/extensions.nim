@@ -8,7 +8,7 @@ import ./schema
 
 type
   McpExtensionMethodHandler* = proc (params: JsonNode,
-                                     context: McpContext): Future[McpResult] {.closure.}
+                                     context: McpContext): Future[McpWireResult] {.closure.}
 
   McpExtensionMethod* = object
     name*: string
@@ -172,7 +172,7 @@ proc findExtensionMethod(registry: McpExtensionRegistry, name: string):
 
 proc dispatchExtensionAsync*(registry: McpExtensionRegistry,
                              request: McpRpcRequest,
-                             context: McpContext): Future[McpResult] {.async.} =
+                             context: McpContext): Future[McpWireResult] {.async.} =
   let found = registry.findExtensionMethod(request.methodName)
   if found.extension.isNil:
     raise newMcpError("Method not found: " & request.methodName,

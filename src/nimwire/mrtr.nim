@@ -111,7 +111,7 @@ proc inputRequestsJson*(inputRequests: McpInputRequests): JsonNode =
     result[key] = toJson(request)
 
 proc newMcpInputRequiredResult*(inputRequests: JsonNode = nil,
-                               requestState = ""): McpResult =
+                               requestState = ""): McpWireResult =
   var fields = newJObject()
   if not inputRequests.isNil:
     if inputRequests.kind != JObject:
@@ -122,11 +122,11 @@ proc newMcpInputRequiredResult*(inputRequests: JsonNode = nil,
   newMcpResult(mcpInputRequired, fields)
 
 proc newMcpInputRequiredResult*(inputRequests: McpInputRequests,
-                               requestState = ""): McpResult =
+                               requestState = ""): McpWireResult =
   newMcpInputRequiredResult(inputRequests.inputRequestsJson, requestState)
 
 proc newMcpInputRequiredResult*(entries: openArray[(string, McpInputRequest)],
-                               requestState = ""): McpResult =
+                               requestState = ""): McpWireResult =
   var inputRequests = initTable[string, McpInputRequest]()
   for entry in entries:
     if entry[0].len == 0 or entry[0] in inputRequests:
@@ -134,7 +134,7 @@ proc newMcpInputRequiredResult*(entries: openArray[(string, McpInputRequest)],
     inputRequests[entry[0]] = entry[1]
   newMcpInputRequiredResult(inputRequests, requestState)
 
-proc parseInputRequests*(value: McpResult): McpInputRequests =
+proc parseInputRequests*(value: McpWireResult): McpInputRequests =
   if value.resultType != mcpInputRequired:
     raise newMcpError("result is not input_required")
   var output = initTable[string, McpInputRequest]()

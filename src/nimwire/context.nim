@@ -9,6 +9,7 @@ type
     mcpTransportUnknown
     mcpTransportStdio
     mcpTransportHttp
+    mcpTransportInProcess
 
   McpTransportInfo* = object
     kind*: McpTransportKind
@@ -74,7 +75,7 @@ type
     lastProgress*: float
     hasReportedProgress*: bool
     hasInputRequired*: bool
-    inputRequired*: McpResult
+    inputRequired*: McpWireResult
 
 proc newMcpPrincipal*(subject: string, claims: JsonNode = nil,
                       issuer = "", scopes: seq[string] = @[]): McpPrincipal =
@@ -234,7 +235,7 @@ proc verifyRequestState*(context: McpContext): JsonNode =
     raise newMcpError("MCP request state verification failed")
   context.requestStatePayload = result
 
-proc requireInput*(context: McpContext, value: McpResult) =
+proc requireInput*(context: McpContext, value: McpWireResult) =
   if context.isNil:
     raise newMcpError("MCP context must not be nil")
   if value.resultType != mcpInputRequired:

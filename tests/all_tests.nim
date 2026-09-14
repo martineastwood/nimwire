@@ -1,5 +1,25 @@
-import std/[asyncdispatch, json, options, os, sequtils, strutils, times, unittest]
+import std/[asyncdispatch, json, options, os, sequtils, strutils, tables, times,
+  unittest]
 import ../src/nimwire
+
+type
+  Weather* = object
+    temperature*: int
+    condition*: string
+
+  WeatherMode = enum
+    wmCurrent
+    wmForecast
+
+  WeatherRequest = object
+    city*: string
+    mode*: WeatherMode
+    units*: Option[string]
+    tags*: seq[string]
+    labels*: Table[string, int]
+
+proc namedWeather(city: string): Weather =
+  Weather(temperature: 16, condition: city & ": cloudy")
 
 suite "nimwire MCP server":
   let server = mcpServer("test-server", "1.0.0"):
@@ -34,6 +54,249 @@ suite "nimwire MCP server":
     check response["result"]["content"][0]["type"].getStr == "text"
     check response["result"]["content"][0]["text"].getStr == "hello"
     check not response["result"]["isError"].getBool
+
+  test "derives typed tool schemas and round trips structured values":
+    let server = newMcpServer("typed", "1.0.0")
+    let derivedSchema = mcpJsonSchema(WeatherRequest)
+    validateJsonSchema(derivedSchema)
+    server.tool "weather", "Current weather",
+      proc (request: WeatherRequest): Weather =
+        Weather(temperature: request.labels["offset"] + 16,
+          condition: request.city & ":" & $request.mode & ":" &
+            (if request.units.isSome: request.units.get else: "default"))
+    server.tool "named-weather", "Named typed handler", namedWeather
+    server.tool "typed-result", "Typed result handler",
+      proc (city: string): McpResult[Weather] =
+        mcpResult(Weather(temperature: 20, condition: city & ": clear"))
+    server.tool "typed-error", "Typed error handler",
+      proc (city: string): McpResult[Weather] =
+        mcpError[Weather]("unavailable", "weather unavailable",
+          %*{"city": city})
+    server.tool "async-typed-result", "Async typed result handler",
+      proc (city: string): Future[McpResult[Weather]] {.async.} =
+        await sleepAsync(0)
+        mcpResult(Weather(temperature: 21, condition: city & ": windy"))
+
+    let listed = server.handleJson(modernRequest(100, "tools/list"))
+    var weather: JsonNode
+    for item in listed["result"]["tools"].items:
+      if item["name"].getStr == "weather": weather = item
+    check not weather.isNil
+    check weather["name"].getStr == "weather"
+    check weather["inputSchema"]["type"].getStr == "object"
+    check weather["inputSchema"]["properties"]["request"]["type"].getStr ==
+      "object"
+    check weather["inputSchema"]["properties"]["request"]["properties"][
+      "mode"]["type"].getStr == "string"
+    check weather["inputSchema"]["properties"]["request"]["properties"][
+      "units"]["anyOf"][1]["type"].getStr == "null"
+    check weather["outputSchema"]["properties"]["temperature"][
+      "type"].getStr == "integer"
+
+    let response = server.handleJson(modernRequest(101, "tools/call", %*{
+      "name": "weather", "arguments": {"request": {
+        "city": "Paris", "mode": "wmCurrent", "tags": ["today"],
+        "labels": {"offset": 2}
+      }}
+    }))
+    check response["result"]["structuredContent"]["temperature"].getInt == 18
+    check response["result"]["structuredContent"]["condition"].getStr ==
+      "Paris:wmCurrent:default"
+
+    let named = server.handleJson(modernRequest(102, "tools/call", %*{
+      "name": "named-weather", "arguments": {"city": "London"}
+    }))
+    check named["result"]["structuredContent"]["condition"].getStr ==
+      "London: cloudy"
+    let typed = server.handleJson(modernRequest(108, "tools/call", %*{
+      "name": "typed-result", "arguments": {"city": "Rome"}
+    }))
+    check typed["result"]["structuredContent"]["temperature"].getInt == 20
+    let typedError = server.handleJson(modernRequest(109, "tools/call", %*{
+      "name": "typed-error", "arguments": {"city": "Rome"}
+    }))
+    check typedError["result"]["isError"].getBool
+    check typedError["result"]["content"][0]["text"].getStr ==
+      "weather unavailable"
+    let asyncTyped = server.handleJson(modernRequest(116, "tools/call", %*{
+      "name": "async-typed-result", "arguments": {"city": "Rome"}
+    }))
+    check asyncTyped["result"]["structuredContent"]["temperature"].getInt == 21
+
+    let declarative = mcpServer("typed-declarative", "1.0.0"):
+      server.tool "city", "Echo city", proc (city: string): string = city
+    let declarativeResponse = declarative.handleJson(modernRequest(107,
+      "tools/call", %*{"name": "city", "arguments": {"city": "Rome"}}))
+    check declarativeResponse["result"]["structuredContent"].getStr == "Rome"
+
+  test "supports direct typed arguments, explicit schemas, and async context":
+    let server = newMcpServer("typed-overrides", "1.0.0")
+    server.tool "echo-typed", "Echo typed text",
+      proc (city: string): string = city,
+      inputSchema = %*{"type": "object", "properties": {
+        "city": {"type": "string", "minLength": 1}},
+        "required": ["city"]},
+      outputSchema = %*{"type": "string"}
+    server.tool "async-typed", "Async typed tool",
+      proc (context: McpContext, city: string): Future[string] {.async.} =
+        await sleepAsync(0)
+        city & ":" & context.methodName
+    server.tool "async-result", "Async MCP result tool",
+      proc (city: string): Future[McpToolResult] {.async.} =
+        await sleepAsync(0)
+        textResult(city)
+
+    let echo = server.handleJson(modernRequest(103, "tools/call", %*{
+      "name": "echo-typed", "arguments": {"city": "Paris"}
+    }))
+    let definitions = server.handleJson(modernRequest(105, "tools/list"))
+    let echoDefinition = definitions["result"]["tools"][2]
+    check echoDefinition["inputSchema"]["properties"]["city"][
+      "minLength"].getInt == 1
+    check echoDefinition["outputSchema"]["type"].getStr == "string"
+    check echo["result"]["structuredContent"].getStr == "Paris"
+
+    let asyncResponse = server.handleJson(modernRequest(104, "tools/call", %*{
+      "name": "async-typed", "arguments": {"city": "Paris"}
+    }))
+    check asyncResponse["result"]["structuredContent"].getStr ==
+      "Paris:tools/call"
+    let rawAsyncResponse = server.handleJson(modernRequest(106, "tools/call",
+      %*{"name": "async-result", "arguments": {"city": "Paris"}}))
+    check rawAsyncResponse["result"]["content"][0]["text"].getStr == "Paris"
+
+  test "declares typed results and context helpers without raw JSON":
+    let server = newMcpServer("typed-helpers", "1.0.0")
+    server.tool "contextual", "Contextual typed tool",
+      proc (cancel: McpCancellation, progress: McpProgressReporter,
+            city: string): string =
+        discard cancel
+        check progress.isNil
+        city
+    let response = server.handleJson(modernRequest(110, "tools/call", %*{
+      "name": "contextual", "arguments": {"city": "Dublin"}
+    }))
+    check response["result"]["structuredContent"].getStr == "Dublin"
+
+  test "links peers in process and mounts collision-safe remote features":
+    let remote = newMcpServer("remote", "1.0.0", listPageSize = 1)
+    remote.addTool mcpTool("echo", "Remote echo", %*{
+      "type": "object", "properties": {"text": {"type": "string"}},
+      "required": ["text"]
+    }, proc (arguments: JsonNode, context: McpContext): McpToolResult =
+      textResult("remote:" & arguments["text"].getStr))
+    remote.addResource mcpResource("urn:remote:doc", "doc",
+      resourceText("urn:remote:doc", "remote document", "text/plain"))
+    let remoteTemplateHandler: McpSyncResourceTemplateReadHandler =
+      proc (uri: string, arguments: JsonNode,
+            context: McpContext): seq[McpResourceContent] = @[
+        resourceText(uri, "remote:" & arguments["id"].getStr)]
+    var remoteTemplate = newMcpResourceTemplate("urn:remote:{id}", "record",
+      remoteTemplateHandler)
+    let remoteResourceCompletion: McpSyncResourceCompletionHandler =
+      proc (argument, prefix: string,
+            context: McpContext): seq[string] = @[prefix & "-record"]
+    remoteTemplate.addCompletion("id", remoteResourceCompletion)
+    remote.addResourceTemplate remoteTemplate
+    var remotePrompt = newMcpPrompt("greet",
+      proc (arguments: McpPromptArguments,
+            context: McpContext): McpPromptMessage =
+        userText("Hello " & arguments["name"]),
+      arguments = @[newMcpPromptArgument("name", required = true)])
+    let remotePromptCompletion: McpSyncPromptCompletionHandler =
+      proc (argument, prefix: string,
+            context: McpContext): seq[string] = @[prefix & "-name"]
+    remotePrompt.addCompletion("name", remotePromptCompletion)
+    remote.addPrompt remotePrompt
+
+    let peer = newMcpInProcessPeer(remote)
+    check (peer.request("server/discover")).resultType == mcpComplete
+    let local = newMcpServer("local", "1.0.0")
+    discard local.mountMcpServer(peer.transport, "upstream")
+
+    let tools = local.handleJson(modernRequest(117, "tools/list"))
+    check tools["result"]["tools"][0]["name"].getStr == "upstream.echo"
+    let call = local.handleJson(modernRequest(118, "tools/call", %*{
+      "name": "upstream.echo", "arguments": {"text": "ok"}}))
+    check call["result"]["content"][0]["text"].getStr == "remote:ok"
+
+    let resources = local.handleJson(modernRequest(119, "resources/list"))
+    let resourceUri = resources["result"]["resources"][0]["uri"].getStr
+    check resources["result"]["resources"][0]["name"].getStr == "upstream.doc"
+    let resource = local.handleJson(modernRequest(120, "resources/read", %*{
+      "uri": resourceUri}))
+    check resource["result"]["contents"][0]["text"].getStr ==
+      "remote document"
+
+    let templates = local.handleJson(modernRequest(121,
+      "resources/templates/list"))
+    let templateUri = templates["result"]["resourceTemplates"][0][
+      "uriTemplate"].getStr
+    check templateUri == "urn:nimwire:proxy:upstream:urn:remote:{id}"
+    let templateResponse = local.handleJson(modernRequest(122, "resources/read", %*{
+      "uri": "urn:nimwire:proxy:upstream:urn:remote:seven"}))
+    check templateResponse["result"]["contents"][0]["text"].getStr ==
+      "remote:seven"
+    let completionContext = newMcpContext(
+      parseMcpMessage(modernRequest(125, "ping")).request)
+    let templateCompletions = waitFor local.completeResourceTemplate(
+      templateUri, "id", "se", completionContext)
+    check templateCompletions == @["se-record"]
+
+    let prompts = local.handleJson(modernRequest(123, "prompts/list"))
+    check prompts["result"]["prompts"][0]["name"].getStr == "upstream.greet"
+    let prompt = local.handleJson(modernRequest(124, "prompts/get", %*{
+      "name": "upstream.greet", "arguments": {"name": "Ada"}}))
+    check prompt["result"]["messages"][0]["content"]["text"].getStr ==
+      "Hello Ada"
+    let promptCompletions = waitFor local.completePromptArgument(
+      "upstream.greet", "name", "Ad", completionContext)
+    check promptCompletions == @["Ad-name"]
+    expect McpError:
+      discard local.mountMcpServer(newMcpInProcessTransport(remote), "upstream")
+
+  test "composes middleware, retries retryable failures, and groups tools":
+    let server = newMcpServer("ergonomics", "1.0.0")
+    var calls = 0
+    var validations = 0
+    var timings: seq[float]
+    server.use mcpValidationMiddleware(
+      proc (name: string, arguments: JsonNode, context: McpContext) =
+        inc validations
+        check name == "retry"
+        check arguments.kind == JObject
+        check not context.isNil)
+    server.use mcpPolicyMiddleware(
+      proc (name: string, arguments: JsonNode, context: McpContext): bool =
+        name == "retry" and arguments.kind == JObject and not context.isNil)
+    server.use mcpTimingMiddleware(
+      proc (name: string, durationMs: float) = timings.add durationMs)
+    server.use mcpRetryMiddleware(maxAttempts = 3)
+    server.addTool mcpTool("retry", "Retryable tool", %*{"type": "object"},
+      proc (arguments: JsonNode, context: McpContext): McpToolResult =
+        inc calls
+        if calls == 1: raise retryableMcpError("try again")
+        textResult("ok"))
+    let response = server.handleJson(modernRequest(111, "tools/call", %*{
+      "name": "retry", "arguments": {}
+    }))
+    check response["result"]["content"][0]["text"].getStr == "ok"
+    check calls == 2
+    check validations == 1
+    check timings.len == 1
+
+    var grouped = newMcpToolGroup("math")
+    grouped.addTool mcpTool("add", "Add", %*{"type": "object"},
+      proc (arguments: JsonNode, context: McpContext): McpToolResult =
+        textResult("sum"))
+    server.addToolGroup(grouped)
+    server.addTools("text", @[mcpTool("upper", "Upper",
+      %*{"type": "object"}, proc (arguments: JsonNode,
+        context: McpContext): McpToolResult = textResult("UP"))])
+    let listed = server.handleJson(modernRequest(112, "tools/list"))
+    check listed["result"]["tools"][0]["name"].getStr == "math.add"
+    check listed["result"]["tools"][1]["name"].getStr == "retry"
+    check listed["result"]["tools"][2]["name"].getStr == "text.upper"
 
   test "rejects unknown tools as invalid params":
     let response = server.handleJson(modernRequest(4, "tools/call", %*{
@@ -672,6 +935,43 @@ suite "nimwire resources":
       "uri": "file:///inside.txt"
     }))
     check response["result"]["contents"][0]["text"].getStr == "inside"
+
+suite "nimwire declarative feature helpers":
+  test "declares resources, templates, prompts, and completions":
+    let server = newMcpServer("declarations", "1.0.0")
+    server.addResource mcpResource("urn:demo:static", "static",
+      resourceText("urn:demo:static", "hello", "text/plain"))
+    let dynamicHandler: McpSyncResourceTemplateReadHandler =
+      proc (uri: string, arguments: JsonNode,
+            context: McpContext): seq[McpResourceContent] {.closure.} = @[
+        resourceText(uri, arguments["id"].getStr, "text/plain")]
+    server.addResourceTemplate mcpResourceTemplate("urn:demo:{id}", "dynamic",
+      dynamicHandler)
+    server.addPrompt mcpPrompt("greet",
+      proc (arguments: McpPromptArguments,
+            context: McpContext): seq[McpPromptMessage] {.closure.} =
+        @[userText("Hello " & arguments["name"])],
+      arguments = @[newMcpPromptArgument("name", required = true)])
+    server.addPromptCompletion("greet", mcpCompletion("name",
+      proc (argument, prefix: string,
+            context: McpContext): seq[string] {.closure.} = @[prefix & "Ada"]))
+    server.addResourceTemplateCompletion("urn:demo:{id}",
+      mcpCompletion("id", proc (argument, prefix: string,
+                                 context: McpContext): seq[string] {.closure.} =
+        @[prefix & "one"]))
+
+    let resource = server.handleJson(modernRequest(113, "resources/read", %*{
+      "uri": "urn:demo:static"
+    }))
+    check resource["result"]["contents"][0]["text"].getStr == "hello"
+    let prompt = server.handleJson(modernRequest(114, "prompts/get", %*{
+      "name": "greet", "arguments": {"name": "Ada"}
+    }))
+    check prompt["result"]["messages"][0]["content"]["text"].getStr ==
+      "Hello Ada"
+    let completions = waitFor server.completePromptArgument("greet", "name", "A",
+      newMcpContext(parseMcpMessage(modernRequest(115, "ping")).request))
+    check completions[0] == "AAda"
 
 suite "nimwire prompts":
   test "registers, lists, and gets prompts with typed arguments":
@@ -1498,7 +1798,7 @@ suite "nimwire tasks and extensions":
     server.enableTasks(newMcpTaskStore(pollIntervalMs = 1))
     server.addTool newMcpTaskTool("slow", "Slow task", %*{
       "type": "object"
-    }, proc (args: JsonNode, context: McpContext): Future[McpResult] {.async.} =
+    }, proc (args: JsonNode, context: McpContext): Future[McpWireResult] {.async.} =
       await context.reportProgress(0.5, 1.0, "halfway")
       await sleepAsync(5)
       newMcpResult(mcpComplete, %*{
@@ -1538,7 +1838,7 @@ suite "nimwire tasks and extensions":
     server.enableTasks()
     server.addTool newMcpTaskTool("http-task", "HTTP task", %*{
       "type": "object"
-    }, proc (args: JsonNode, context: McpContext): Future[McpResult] {.async.} =
+    }, proc (args: JsonNode, context: McpContext): Future[McpWireResult] {.async.} =
       newMcpResult(mcpComplete, %*{"content": [], "isError": false}))
     let body = taskRequest(201, "tools/call", %*{
       "name": "http-task", "arguments": {}
@@ -1572,7 +1872,7 @@ suite "nimwire tasks and extensions":
     server.enableTasks(durable)
     server.addTool newMcpTaskTool("stored", "Stored task", %*{
       "type": "object"
-    }, proc (args: JsonNode, context: McpContext): Future[McpResult] {.async.} =
+    }, proc (args: JsonNode, context: McpContext): Future[McpWireResult] {.async.} =
       newMcpResult(mcpComplete, %*{"content": [], "isError": false}))
     let created = server.handleJson(taskRequest(197, "tools/call", %*{
       "name": "stored", "arguments": {}
@@ -1589,7 +1889,7 @@ suite "nimwire tasks and extensions":
     expiring.enableTasks(newMcpTaskStore(ttlMs = 1))
     expiring.addTool newMcpTaskTool("short", "Short task", %*{
       "type": "object"
-    }, proc (args: JsonNode, context: McpContext): Future[McpResult] {.async.} =
+    }, proc (args: JsonNode, context: McpContext): Future[McpWireResult] {.async.} =
       newMcpResult(mcpComplete, %*{"content": [], "isError": false}))
     let short = expiring.handleJson(taskRequest(199, "tools/call", %*{
       "name": "short", "arguments": {}
@@ -1605,7 +1905,7 @@ suite "nimwire tasks and extensions":
     server.enableTasks()
     server.addTool newMcpTaskTool("input", "Needs input", %*{
       "type": "object"
-    }, proc (args: JsonNode, context: McpContext): Future[McpResult] {.async.} =
+    }, proc (args: JsonNode, context: McpContext): Future[McpWireResult] {.async.} =
       if context.inputResponses.len == 0:
         newMcpResult(mcpInputRequired, %*{
           "inputRequests": {
@@ -1647,7 +1947,7 @@ suite "nimwire tasks and extensions":
 
     server.addTool newMcpTaskTool("cancel", "Cancellable", %*{
       "type": "object"
-    }, proc (args: JsonNode, context: McpContext): Future[McpResult] {.async.} =
+    }, proc (args: JsonNode, context: McpContext): Future[McpWireResult] {.async.} =
       await sleepAsync(50)
       context.checkCancelled()
       newMcpResult(mcpComplete, %*{"content": [], "isError": false}))
@@ -1668,7 +1968,7 @@ suite "nimwire tasks and extensions":
     server.enableTasks()
     server.addTool newMcpTaskTool("failed", "Failed task", %*{
       "type": "object"
-    }, proc (args: JsonNode, context: McpContext): Future[McpResult] {.async.} =
+    }, proc (args: JsonNode, context: McpContext): Future[McpWireResult] {.async.} =
       raise newMcpError("task failed", mcpInvalidParamsCode, %*{
         "reason": "test"
       }))
@@ -1690,7 +1990,7 @@ suite "nimwire tasks and extensions":
       metadata = %*{"com.example/serverMode": "demo"},
       requiresClientCapability = true)
     extension.addExtensionMethod("com.example/echo",
-      proc (params: JsonNode, context: McpContext): Future[McpResult] {.async.} =
+      proc (params: JsonNode, context: McpContext): Future[McpWireResult] {.async.} =
         newMcpResult(mcpComplete, %*{"echo": params["value"]}),
       inputSchema = %*{"type": "object", "required": ["value"],
                        "properties": {"value": {"type": "string"}}},
@@ -1727,7 +2027,7 @@ suite "nimwire tasks and extensions":
     server.enableTasks()
     server.addTool newMcpTaskTool("owned", "Owned task", %*{
       "type": "object"
-    }, proc (args: JsonNode, context: McpContext): Future[McpResult] {.async.} =
+    }, proc (args: JsonNode, context: McpContext): Future[McpWireResult] {.async.} =
       newMcpResult(mcpComplete, %*{"content": [], "isError": false}))
     let request = taskRequest(195, "tools/call", %*{
       "name": "owned", "arguments": {}
