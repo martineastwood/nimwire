@@ -11,3 +11,4 @@ docs/node_modules/
 docs/dist/
 docs/.astro/
 docs/*.tsbuildinfo
+docs/src/content/docs/reference/api/

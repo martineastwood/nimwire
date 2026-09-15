@@ -1,7 +1,7 @@
 // @ts-check
 import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
-import starlightThemeBlack from 'starlight-theme-black';
+import starlightThemeNext from 'starlight-theme-next';
 
 export default defineConfig({
 	site: 'https://nimwire.niminal.dev',
@@ -9,13 +9,17 @@ export default defineConfig({
 		starlight({
 			title: 'nimwire',
 			description: 'Build MCP servers and backends in Nim.',
+			customCss: ['./src/styles/sidebar.css'],
 			social: [{ icon: 'github', label: 'GitHub', href: 'https://github.com/martineastwood/nimwire' }],
-			plugins: [
-				starlightThemeBlack({
-					navLinks: [{ label: 'Niminal', link: 'https://niminal.dev' }],
-					docs: { showMarkdownActions: false },
-				}),
+			sidebar: [
+				{ label: 'Introduction', slug: 'index' },
+				{
+					label: 'API reference',
+					collapsed: true,
+					items: [{ autogenerate: { directory: 'reference/api' } }],
+				},
 			],
+			plugins: [starlightThemeNext()],
 		}),
 	],
 });

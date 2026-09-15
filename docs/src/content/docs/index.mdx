@@ -1,0 +1,48 @@
+---
+title: nimwire
+description: Build Model Context Protocol servers in Nim.
+template: splash
+hero:
+  title: MCP servers in Nim.
+  tagline: Tools, resources, prompts, transports, tasks, and authorization for the Model Context Protocol, in native Nim code.
+  actions:
+    - text: Read the API reference
+      link: /reference/api/nimwire/
+      icon: right-arrow
+    - text: View on GitHub
+      link: https://github.com/martineastwood/nimwire
+      icon: external
+      variant: minimal
+---
+
+import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
+
+## Everything a server needs
+
+<CardGrid stagger={true}>
+	<Card title="Typed tools" icon="setting">
+		Register raw JSON handlers or typed procs, and let nimwire derive the MCP
+		input and output schemas at compile time.
+	</Card>
+	<Card title="Resources and prompts" icon="open-book">
+		Static and templated resources with text or binary contents, plus typed
+		prompts with completion hooks.
+	</Card>
+	<Card title="Stdio and HTTP" icon="rocket">
+		Serve newline-delimited JSON-RPC over stdio, or adapt Streamable HTTP
+		requests into any web framework.
+	</Card>
+	<Card title="Production controls" icon="approve-check">
+		Bearer authorization, bounded security limits, cancellation, progress,
+		deadlines, and optional request observability hooks.
+	</Card>
+</CardGrid>
+
+## Explore the library
+
+<CardGrid>
+	<LinkCard title="API reference" description="Every exported module, type, and procedure." href="/reference/api/nimwire/" />
+	<LinkCard title="Security checklist" description="Read this before deploying a remote server." href="https://github.com/martineastwood/nimwire/blob/main/SECURITY.md" />
+	<LinkCard title="Example servers" description="Echo, HTTP, auth, prompts, and resources." href="https://github.com/martineastwood/nimwire/tree/main/examples" />
+	<LinkCard title="Niminal stack" description="See nimwire alongside the rest of the Niminal projects." href="https://niminal.dev" />
+</CardGrid>
