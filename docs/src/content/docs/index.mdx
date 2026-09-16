@@ -6,8 +6,8 @@ hero:
   title: MCP servers in Nim.
   tagline: Tools, resources, prompts, transports, tasks, and authorization for the Model Context Protocol, in native Nim code.
   actions:
-    - text: Read the API reference
-      link: /reference/api/nimwire/
+    - text: Start building
+      link: /guides/quickstart/
       icon: right-arrow
     - text: View on GitHub
       link: https://github.com/martineastwood/nimwire
@@ -41,6 +41,10 @@ import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
 ## Explore the library
 
 <CardGrid>
+	<LinkCard title="Quickstart" description="Build a stdio server in a few lines." href="/guides/quickstart/" />
+	<LinkCard title="Typed tools" description="Derive MCP schemas from Nim procedures and types." href="/guides/tools/" />
+	<LinkCard title="Resources and prompts" description="Expose data and reusable messages to clients." href="/guides/resources/" />
+	<LinkCard title="Transports" description="Choose stdio, Streamable HTTP, or in-process delivery." href="/guides/transports/" />
 	<LinkCard title="API reference" description="Every exported module, type, and procedure." href="/reference/api/nimwire/" />
 	<LinkCard title="Security checklist" description="Read this before deploying a remote server." href="https://github.com/martineastwood/nimwire/blob/main/SECURITY.md" />
 	<LinkCard title="Example servers" description="Echo, HTTP, auth, prompts, and resources." href="https://github.com/martineastwood/nimwire/tree/main/examples" />
