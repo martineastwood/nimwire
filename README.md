@@ -217,3 +217,7 @@ returns validated claims. Protected-resource metadata is served from
 `server.setToolFilter`, `setResourceFilter`, and `setPromptFilter` for
 principal-based visibility. See [examples/auth_server.nim](examples/auth_server.nim)
 and [SECURITY.md](SECURITY.md) before exposing a server publicly.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
