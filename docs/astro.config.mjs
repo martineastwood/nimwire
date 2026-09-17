@@ -9,7 +9,7 @@ export default defineConfig({
 		starlight({
 			title: 'nimwire',
 			description: 'Build Model Context Protocol servers in Nim with typed tools, resources, prompts, transports, and production controls.',
-			favicon: '/favicon.svg',
+			favicon: '/favicon.ico',
 			head: [
 				{ tag: 'link', attrs: { rel: 'icon', href: '/favicon.ico', sizes: '48x48' } },
 				{ tag: 'link', attrs: { rel: 'icon', type: 'image/png', sizes: '32x32', href: '/favicon-32x32.png' } },
