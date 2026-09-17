@@ -384,12 +384,12 @@ proc mcpSchemaFromType*(n: NimNode): JsonNode =
 
   let name = mcpSchemaTypeName(mcpSchemaTypeInst(core))
   case name
-  of "string", "cstring": %*{"type": "string"}
-  of "bool": %*{"type": "boolean"}
+  of "string", "cstring": return %*{"type": "string"}
+  of "bool": return %*{"type": "boolean"}
   of "int", "int8", "int16", "int32", "int64", "uint", "uint8",
-     "uint16", "uint32", "uint64", "byte": %*{"type": "integer"}
-  of "float", "float32", "float64": %*{"type": "number"}
-  of "JsonNode": %*{}
+     "uint16", "uint32", "uint64", "byte": return %*{"type": "integer"}
+  of "float", "float32", "float64": return %*{"type": "number"}
+  of "JsonNode": return %*{}
   else:
     error("jsonSchema: unsupported type " & name, n)
 
