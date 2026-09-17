@@ -56,6 +56,34 @@ structuredResult(%*{"temperature": 16, "unit": "C"})
 
 `textResult` creates a text content item. `jsonResult` and `structuredResult` include structured content as well as a readable text representation. Set `isError = true` when a tool completed but its result describes a tool failure.
 
+## Return images, audio, and resources
+
+Tools can return multiple content blocks. Build an array and pass it to `newMcpToolResult`:
+
+```nim
+newMcpToolResult(@[
+  textContent("Screenshot attached"),
+  imageContent(base64Image, "image/png"),
+  resourceLinkContent("file:///tmp/report.txt", "report",
+    mimeType = "text/plain")])
+```
+
+Use `audioContent` for audio blocks and `embeddedResourceContent` when the payload should travel inline. These helpers match the content shapes used by prompts.
+
+## Add presentation metadata
+
+Tools can expose a display title, icons, and caller-facing annotations in discovery:
+
+```nim
+server.addTool newMcpTool(
+  "weather", "Get current weather", inputSchema, handler,
+  title = "Current weather",
+  icons = %*[{"src": "https://example.com/weather.svg"}],
+  annotations = %*{"readOnlyHint": true})
+```
+
+`title`, `icons`, and `annotations` are validated at registration time. Do not use annotations as an authorization policy. Use [Security](/guides/security/) filters for access control instead.
+
 For typed failures, return `McpResult[T]`:
 
 ```nim

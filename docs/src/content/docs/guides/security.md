@@ -37,6 +37,12 @@ Missing or invalid credentials produce `401`. A valid token without a required s
 
 For a custom policy, supply `middleware` instead of `verifier`. An allowed decision must include a principal.
 
+The same `McpAuthorizationConfig` works on `newMcpWebSocketConfig`. WebSocket clients send the bearer token during the HTTP upgrade request.
+
+## Reject token passthrough
+
+When your server calls another MCP or HTTP service, do not forward the caller's MCP bearer token. Call `rejectTokenPassthrough(authorizationHeader)` before making the downstream request. It raises when a bearer token is present.
+
 ## Filter features by principal
 
 Authorization and visibility are separate decisions. Use filters to decide which already-registered features a principal can discover and call:

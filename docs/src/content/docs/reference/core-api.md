@@ -16,7 +16,9 @@ Most applications can import `nimwire` and use the complete public API. Focused 
 | `server.addPrompt` | Publish prompts and arguments |
 | `serveStdio` | Run a newline-delimited stdio server |
 | `newMcpHttpServer` | Run the stdlib Streamable HTTP adapter |
+| `newMcpWebSocketServer` | Run the stdlib WebSocket adapter |
 | `handleHttpRequest` | Adapt HTTP in another web framework |
+| `handleMessageAsync` | Dispatch already-parsed JSON-RPC in a custom transport |
 | `newMcpInProcessPeer` | Send requests without a process or socket |
 
 ## Public modules
@@ -31,6 +33,7 @@ Most applications can import `nimwire` and use the complete public API. Focused 
 | `nimwire/context` | Request metadata, principals, cancellation, progress, and state handles |
 | `nimwire/transports/stdio` | Stdio framing and serving |
 | `nimwire/transports/http` | Streamable HTTP request handling and stdlib server |
+| `nimwire/transports/websocket` | WebSocket transport and stdlib server |
 | `nimwire/transport` | Typed message transports and `McpPeer` |
 | `nimwire/transports/inproc` | Linked in-process transports |
 | `nimwire/auth` | Bearer authorization and protected-resource metadata |

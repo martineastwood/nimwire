@@ -37,6 +37,21 @@ server.tool "audit", "Record an audit event",
 
 You can receive one `McpContext`, `McpCancellation`, `McpProgressReporter`, or `McpLogger` parameter. Those parameters are supplied by nimwire and do not appear in the input schema.
 
+Handlers can also return `Future[T]`, `Future[McpToolResult]`, or `Future[McpResult[T]]` when the work is asynchronous:
+
+```nim
+import std/[asyncdispatch, json]
+
+server.tool "fetch", "Fetch remote data",
+  proc (url: string): Future[string] {.async.} =
+    await sleepAsync(10)
+    "fetched " & url
+```
+
+## Debug macro expansion
+
+When a typed tool fails to compile or the generated schema looks wrong, compile with `-d:mcpwireDebugMacros`. nimwire prints the registration code the `tool` macro generated.
+
 ## Supported types
 
 Schema derivation supports:

@@ -36,7 +36,7 @@ server.addTool rebuild
 server.serveStdio()
 ```
 
-Task handlers return `mcpComplete` for a final result or `mcpInputRequired` when they need client input. They must not return another `mcpTask` result.
+Task handlers return `mcpComplete` for a final result or `mcpInputRequired` when they need client input. See [Multi-round-trip input](/guides/mrtr/) for elicitation and retry patterns. They must not return another `mcpTask` result.
 
 The initial `tools/call` response has `resultType: "task"` and includes a task ID, status, timestamps, expiry information, and a suggested poll interval. Progress updates are stored on the task.
 

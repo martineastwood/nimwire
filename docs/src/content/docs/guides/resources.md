@@ -86,9 +86,9 @@ server.addResourceTemplate(memoTemplate)
 
 `resourceTemplateVariables` lists the variable names, and `matchResourceTemplate` returns decoded values when a URI matches. One variable is supported in each template expression.
 
-## Completions and change notifications
+## Completions
 
-Attach a completion handler with `server.addResourceTemplateCompletion`. The handler receives the argument name, the current prefix, and request context. Results are capped at 100 values, with `total` and `hasMore` hints.
+Attach a completion handler with `server.addResourceTemplateCompletion`. See [Completion](/guides/completion/) for prompt and resource completion patterns, prior-argument values, and response limits.
 
 Call `server.markResourcesChanged()` after adding or removing resources from the application view. Call `server.markResourceUpdated(uri)` when the contents of one URI changed. See [Subscriptions](/guides/subscriptions/) for delivering those notifications.
 

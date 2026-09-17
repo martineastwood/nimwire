@@ -50,6 +50,22 @@ waitFor http.serveHttp()
 
 Web frameworks can adapt their request object to `McpHttpRequest`, call `handleHttpRequest`, then write the returned `McpHttpResponse`. Populate the request's method, path, headers, body, cancellation signal, and optional stream callbacks. This keeps framework-specific routing outside nimwire.
 
+```nim
+import std/asyncdispatch
+import nimwire
+
+proc handleMyFrameworkRequest(server: McpServer, raw: MyRequest):
+    Future[MyResponse] {.async.} =
+  var request = newMcpHttpRequest(raw.method, raw.path, raw.body, raw.headers)
+  request.cancellation = raw.cancellation
+  let response = await server.handleHttpRequest(request, myHttpConfig)
+  result.status = response.status
+  result.headers = response.headers
+  result.body = response.body
+```
+
+`toMcpHttpRequest` adapts Nim's `asynchttpserver.Request` when you only need the stdlib shape.
+
 POST requests need `Content-Type: application/json`, an `Accept` header containing both `application/json` and `text/event-stream`, and headers that match the JSON body:
 
 ```text
@@ -123,5 +139,9 @@ peer.close()
 ```
 
 The in-process transport carries the same validated JSON-RPC values as other transports, which makes it useful for tests and [composition](/guides/composition/).
+
+## Custom transports
+
+When you already parse JSON-RPC yourself, call `handleMessageAsync` or `dispatchAsync` on `McpServer`. Build an `McpContext` with `newMcpContext`, attach a notification sender when the transport must emit progress or subscription events, and write the returned `McpJsonRpcMessage`. Stdio, HTTP, WebSocket, and in-process transports all use this boundary.
 
 Related: [Security](/guides/security/) and the [HTTP API reference](/reference/api/nimwire/transports/http/).

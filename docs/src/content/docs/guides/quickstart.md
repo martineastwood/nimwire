@@ -61,6 +61,12 @@ The tool call body looks like this:
 
 Every stdio message is one line. nimwire validates the JSON-RPC envelope and the tool arguments against the schema before invoking your handler.
 
+## Try it with MCP Inspector
+
+The [MCP Inspector](https://github.com/modelcontextprotocol/inspector) is the fastest way to exercise discovery and tool calls interactively. Point it at your compiled executable as a stdio server, or at an HTTP or WebSocket endpoint once you add a transport.
+
+For manual debugging, pipe one JSON-RPC line at a time as shown above. Keep stdout reserved for protocol output and write diagnostics to stderr.
+
 ## Where to go next
 
 - [Server basics](/guides/server-basics/): add more tools and return structured data.

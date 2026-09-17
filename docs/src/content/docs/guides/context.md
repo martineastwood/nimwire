@@ -44,35 +44,15 @@ Progress values must be non-negative. When `total` is set, progress cannot excee
 
 ## Use request metadata
 
-`context.metadata` contains the protocol version, client information, client capabilities, trace context, requested log level, and progress token. `context.transport` identifies stdio, HTTP, or in-process delivery. `context.principal` is populated by HTTP authorization or by the framework adapter.
+`context.metadata` contains the protocol version, client information, client capabilities, trace context, requested log level, and progress token. `context.transport` identifies stdio, HTTP, WebSocket, or in-process delivery. `context.principal` is populated by HTTP or WebSocket authorization, or by the framework adapter.
 
 Use `context.log(level, message)` for request-scoped logs. The client's `logLevel` metadata is treated as the minimum level. A logger must be supplied by the transport or framework adapter.
 
 ## Ask for more input
 
-Tools, prompts, and resources can return `input_required` without keeping a server session alive. Build an input request and install it on the context:
+Tools, prompts, and resources can pause with `input_required` instead of keeping a server session alive. Call `context.requireInput(...)` with a value from `newMcpInputRequiredResult`, then read answers from `context.inputResponse(key)` on the next request.
 
-```nim
-let confirmation = newMcpElicitationFormRequest(
-  "Allow this operation?",
-  %*{
-    "type": "object",
-    "properties": {"confirmed": {"type": "boolean"}},
-    "required": ["confirmed"],
-    "additionalProperties": false
-  })
-
-if context.inputResponse("confirmation").isNil:
-  context.requireInput(newMcpInputRequiredResult([
-    ("confirmation", confirmation)]))
-  return textResult("")
-
-let response = context.inputResponse("confirmation")
-```
-
-On the next request, the client sends `inputResponses` and can include the returned `requestState`. Configure `requestStateSealer` and `requestStateVerifier` on `newMcpServer` when that state must be authenticated. The library does not invent a server-side session for this flow.
-
-`McpInputClient` helps a custom client answer `elicitation/create`, `sampling/createMessage`, or `roots/list` requests and create a fresh JSON-RPC ID for each retry. See the [MRTR API reference](/reference/api/nimwire/mrtr/).
+For form elicitation, URL elicitation, request-state sealing, and client-side retries, see [Multi-round-trip input](/guides/mrtr/).
 
 ## Carry application state safely
 
@@ -86,4 +66,4 @@ let claim = states.verifyStateHandle(handle, "user-42")
 
 You can attach the store to a context through the transport adapter. A handle made for one principal does not verify for another principal.
 
-Related: [Tasks](/guides/tasks/) for durable long-running work and [Security](/guides/security/) for principal setup.
+Related: [Multi-round-trip input](/guides/mrtr/), [Tasks](/guides/tasks/) for durable long-running work, and [Security](/guides/security/) for principal setup.

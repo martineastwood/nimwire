@@ -40,22 +40,7 @@ Construct the content, then pass it to `userPrompt` or `assistantPrompt`. nimwir
 
 ## Add completions
 
-Completions help a client fill a prompt argument:
-
-```nim
-let completionHandler: McpSyncPromptCompletionHandler = proc (
-    argument, prefix: string,
-    context: McpContext): seq[string] =
-  discard argument
-  discard context
-  @[prefix & " example"]
-
-server.addPromptCompletion("review", "code", completionHandler)
-```
-
-The same completion API accepts an async handler or a reusable `mcpCompletion` value. A completion request can include prior argument values in `context.completionArguments`.
-
-The server accepts `ref/prompt` and `ref/resource` completion references and returns at most 100 suggestions. The response includes the untrimmed `total` and a `hasMore` flag.
+Use `server.addPromptCompletion` or the `mcpCompletion` helper to suggest values while a client fills a prompt argument. See [Completion](/guides/completion/) for examples, resource-template completion, and prior-argument values.
 
 ## Change notifications
 

@@ -39,6 +39,7 @@ The executable reads newline-delimited JSON-RPC messages from stdin and writes r
 - **Prompts:** return text, media, resource links, or embedded resources from typed string arguments.
 - **Transports:** use stdio for local clients, Streamable HTTP or WebSocket for remote clients, or an in-process transport for composition and tests.
 - **Long-running work:** opt into MCP Tasks with expiring in-memory storage or durable storage callbacks.
+- **Multi-round-trip input:** pause a tool, prompt, or resource call with `input_required` and resume on the next request.
 - **Production features:** add authorization, principal-based visibility, cancellation, progress, limits, request logs, metrics, and tracing hooks.
 
 ## A small, focused API
@@ -55,5 +56,6 @@ As the application grows, focused imports such as `nimwire/server`, `nimwire/res
 
 - [Quickstart](/guides/quickstart/): build, run, and inspect a complete stdio server.
 - [Server basics](/guides/server-basics/): register tools and understand MCP responses.
+- [Multi-round-trip input](/guides/mrtr/): ask for confirmation or client-side input across requests.
 - [Transports](/guides/transports/): choose stdio, HTTP, WebSocket, or in-process delivery.
 - [Examples](/examples/): copy the runnable servers from the repository.
