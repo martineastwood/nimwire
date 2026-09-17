@@ -125,14 +125,14 @@ proc headerValue(headers: openArray[WsHeader], name: string): string =
 
 proc hasToken(value, expected: string): bool =
   for token in value.split(','):
-    if token.strip.toLowerAscii == expected.toLowerAscii: return true
+    if strutils.strip(token).toLowerAscii == expected.toLowerAscii: return true
 
 proc endpointPath(path: string): string =
   let query = path.find('?')
   if query < 0: path else: path[0 ..< query]
 
 proc hostWithoutPort(value: string): string =
-  result = value.strip.toLowerAscii
+  result = strutils.strip(value).toLowerAscii
   if result.startsWith("["):
     let close = result.find(']')
     if close >= 0: return result[1 ..< close]
@@ -147,10 +147,10 @@ proc allowedHost(config: McpWebSocketConfig, headers: openArray[WsHeader]): bool
   if config.allowedHosts.len == 0: return true
   let values = headers.headerValues("Host")
   if values.len != 1: return false
-  let host = values[0].strip.toLowerAscii
+  let host = strutils.strip(values[0]).toLowerAscii
   let hostname = hostWithoutPort(host)
   for allowed in config.allowedHosts:
-    let value = allowed.strip.toLowerAscii
+    let value = strutils.strip(allowed).toLowerAscii
     if host == value or (value == hostWithoutPort(value) and hostname == value):
       return true
 
@@ -229,7 +229,7 @@ proc parseHeaders(headerBlock: string): tuple[methodName, target: string,
     if separator <= 0:
       raise protocolFault(1002, "Invalid WebSocket header")
     let name = line[0 ..< separator]
-    let value = line[separator + 1 .. ^1].strip
+    let value = strutils.strip(line[separator + 1 .. ^1])
     if '\r' in value or '\n' in value:
       raise protocolFault(1002, "Invalid WebSocket header value")
     result.headers.add WsHeader(name: name, value: value)
@@ -274,7 +274,7 @@ proc handshake(connection: McpWebSocketConnection): Future[bool] {.async.} =
     return await rejectHandshake(connection.socket, 426,
       "WebSocket version 13 is required")
 
-  let key = parsed.headers.headerValue("Sec-WebSocket-Key").strip
+  let key = strutils.strip(parsed.headers.headerValue("Sec-WebSocket-Key"))
   try:
     if decode(key).len != 16:
       raise newException(ValueError, "invalid key")

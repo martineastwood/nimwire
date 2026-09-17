@@ -161,7 +161,7 @@ proc validHeaderEnvelope(request: McpHttpRequest): bool =
   true
 
 proc hostWithoutPort(value: string): string =
-  result = value.strip.toLowerAscii
+  result = strutils.strip(value).toLowerAscii
   if result.startsWith("["):
     let close = result.find(']')
     if close >= 0: return result[1 ..< close]
@@ -176,10 +176,10 @@ proc allowedHost(config: McpHttpConfig, request: McpHttpRequest): bool =
   if config.allowedHosts.len == 0: return true
   let values = headerValues(request.headers, "Host")
   if values.len != 1: return false
-  let host = values[0].strip.toLowerAscii
+  let host = strutils.strip(values[0]).toLowerAscii
   let hostname = hostWithoutPort(host)
   for allowed in config.allowedHosts:
-    let value = allowed.strip.toLowerAscii
+    let value = strutils.strip(allowed).toLowerAscii
     if host == value: return true
     if value == hostWithoutPort(value) and hostname == value: return true
   false
@@ -219,13 +219,13 @@ proc authorizationFailureResponse(config: McpHttpConfig,
 proc accepts(headers: openArray[McpHttpHeader], mediaType: string): bool =
   for value in headerValues(headers, "Accept"):
     for item in value.split(','):
-      let candidate = item.split(';', 1)[0].strip.toLowerAscii
+      let candidate = strutils.strip(item.split(';', 1)[0]).toLowerAscii
       if candidate == mediaType: return true
   false
 
 proc isJsonContentType(headers: openArray[McpHttpHeader]): bool =
   let values = headerValues(headers, "Content-Type")
-  values.len == 1 and values[0].split(';', 1)[0].strip.toLowerAscii ==
+  values.len == 1 and strutils.strip(values[0].split(';', 1)[0]).toLowerAscii ==
     "application/json"
 
 proc safePlainHeaderValue(value: string): bool =

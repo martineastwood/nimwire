@@ -1351,7 +1351,7 @@ proc handleMessageAsync*(server: McpServer, message: McpJsonRpcMessage,
     finally:
       if tracked: server.untrackRequest(request.id)
   of mcpResponseMessage, mcpErrorMessage:
-    some(errorResponse(McpId(kind: mcpNullId), mcpInvalidRequestCode,
+    return some(errorResponse(McpId(kind: mcpNullId), mcpInvalidRequestCode,
       "server accepts requests and notifications only"))
 
 proc handleJsonAsync*(server: McpServer,
