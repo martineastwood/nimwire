@@ -45,6 +45,7 @@ proc transportName(transport: McpTransportKind): string =
   of mcpTransportUnknown: "unknown"
   of mcpTransportStdio: "stdio"
   of mcpTransportHttp: "http"
+  of mcpTransportWebSocket: "websocket"
   of mcpTransportInProcess: "in-process"
 
 proc newMcpRequestEvent*(context: McpContext, methodName = "",

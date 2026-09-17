@@ -1,5 +1,5 @@
-import std/[asyncdispatch, json, options, os, sequtils, strutils, tables, times,
-  unittest]
+import std/[asyncdispatch, asyncnet, json, options, os, sequtils, strutils,
+  tables, times, unittest]
 import ../src/nimwire
 
 type
@@ -20,6 +20,45 @@ type
 
 proc namedWeather(city: string): Weather =
   Weather(temperature: 16, condition: city & ": cloudy")
+
+proc readExact(socket: AsyncSocket, size: int): Future[string] {.async.} =
+  result = newString(size)
+  var offset = 0
+  while offset < size:
+    let chunk = await socket.recv(size - offset)
+    if chunk.len == 0: raise newException(IOError, "socket closed")
+    copyMem(addr result[offset], unsafeAddr chunk[0], chunk.len)
+    offset += chunk.len
+
+proc readHeaders(socket: AsyncSocket): Future[string] {.async.} =
+  while not result.endsWith("\r\n\r\n"):
+    let chunk = await socket.recv(1)
+    if chunk.len == 0: raise newException(IOError, "socket closed")
+    result.add chunk
+
+proc readFrame(socket: AsyncSocket): Future[tuple[opcode: int,
+    payload: string]] {.async.} =
+  let first = (await readExact(socket, 1))[0].ord
+  let second = (await readExact(socket, 1))[0].ord
+  var length = second and 0x7f
+  if length == 126:
+    let bytes = await readExact(socket, 2)
+    length = (bytes[0].ord shl 8) or bytes[1].ord
+  result.opcode = first and 0x0f
+  result.payload = await readExact(socket, length)
+
+proc clientFrame(payload: string, opcode = 1): string =
+  const mask = "test"
+  result.add char(0x80 or opcode)
+  if payload.len < 126:
+    result.add char(0x80 or payload.len)
+  else:
+    result.add char(0x80 or 126)
+    result.add char((payload.len shr 8) and 0xff)
+    result.add char(payload.len and 0xff)
+  result.add mask
+  for index in 0 ..< payload.len:
+    result.add char(payload[index].ord xor mask[index mod 4].ord)
 
 suite "nimwire MCP server":
   let server = mcpServer("test-server", "1.0.0"):
@@ -738,6 +777,43 @@ suite "nimwire Streamable HTTP":
     waitFor sleepAsync(0)
     check streamed.len == 3
     check streamed[2]["id"].getInt == 10
+
+suite "nimwire WebSocket transport":
+  test "upgrades, dispatches JSON-RPC, and answers ping":
+    let server = newMcpServer("websocket", "1.0.0")
+    let websocket = newMcpWebSocketServer(server,
+      newMcpWebSocketConfig(port = Port(0)))
+    let serving = websocket.serveWebSocket()
+    let client = newAsyncSocket()
+    waitFor client.connect("127.0.0.1", websocket.getPort)
+    waitFor client.send("GET /mcp HTTP/1.1\r\n" &
+      "Host: 127.0.0.1\r\n" &
+      "Upgrade: websocket\r\n" &
+      "Connection: Upgrade\r\n" &
+      "Sec-WebSocket-Version: 13\r\n" &
+      "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n")
+    let handshake = waitFor readHeaders(client)
+    check handshake.startsWith("HTTP/1.1 101 Switching Protocols")
+    check "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=" in handshake
+
+    waitFor client.send(clientFrame("hello", 9))
+    let pong = waitFor readFrame(client)
+    check pong.opcode == 10
+    check pong.payload == "hello"
+
+    waitFor client.send(clientFrame($modernRequest(1, "ping")))
+    let response = waitFor readFrame(client)
+    check response.opcode == 1
+    check response.payload.parseJson["id"].getInt == 1
+    check response.payload.parseJson["result"]["resultType"].getStr ==
+      "complete"
+
+    waitFor client.send(clientFrame(char(3) & char(232), 8))
+    let close = waitFor readFrame(client)
+    check close.opcode == 8
+    client.close()
+    websocket.shutdown()
+    waitFor serving
 
 suite "nimwire request context":
   test "hides unexpected handler errors and logs them":

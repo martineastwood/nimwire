@@ -15,6 +15,7 @@ Run the resulting executable with an MCP client, or pipe newline-delimited JSON-
 
 - [Echo server](./echo-server): register one tool and serve stdio.
 - [HTTP server](./http-server): serve the same style of tool over Streamable HTTP.
+- [WebSocket server](./websocket-server): keep a bidirectional MCP connection open.
 - [Prompts server](./prompts-server): define a typed prompt and completion hook.
 - [Resources server](./resources-server): serve files, generated data, and URLs.
 - [Auth server](./auth-server): enable bearer authorization and scope checks.

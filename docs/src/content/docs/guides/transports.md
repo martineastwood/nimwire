@@ -1,9 +1,9 @@
 ---
 title: Transports
-description: Serve nimwire over stdio, Streamable HTTP, or an in-process link.
+description: Serve nimwire over stdio, Streamable HTTP, WebSocket, or an in-process link.
 ---
 
-The server registry is independent of delivery. Choose stdio when an MCP client launches your executable, Streamable HTTP for a network endpoint, or in-process transport when two Nim components share a process.
+The server registry is independent of delivery. Choose stdio when an MCP client launches your executable, Streamable HTTP or WebSocket for a network endpoint, or in-process transport when two Nim components share a process.
 
 ## Stdio
 
@@ -67,6 +67,46 @@ Configure `maxBodyBytes`, `maxNestingDepth`, `requestTimeoutMs`, and `maxConcurr
 `preferSse = true` enables the standard adapter's event-stream response shape. Use a `streamWriter` when a framework adapter needs to send notifications or streamed responses as they arrive.
 
 The built-in adapter does not terminate TLS. Put a public HTTP server behind TLS and a trusted reverse proxy. The repository includes a minimal [reverse proxy configuration](https://github.com/martineastwood/nimwire/blob/main/examples/reverse_proxy.conf).
+
+## WebSocket
+
+Use WebSocket when a client needs one long-lived, bidirectional connection. The
+server accepts one MCP JSON-RPC request or notification per text message and
+keeps the connection open for later requests, progress notifications, and
+subscriptions:
+
+```nim
+import std/[asyncdispatch, json, nativesockets]
+import nimwire
+
+let app = mcpServer("websocket-example", "1.0.0"):
+  server.addTool mcpTool("echo", "Echo text", %*{
+    "type": "object",
+    "properties": {"text": {"type": "string"}},
+    "required": ["text"]
+  }, proc (args: JsonNode, ignoredContext: McpContext): McpToolResult =
+    textResult(args["text"].getStr))
+
+let websocket = newMcpWebSocketServer(app, newMcpWebSocketConfig(
+  endpoint = "/mcp", host = "127.0.0.1", port = Port(8080)))
+
+waitFor websocket.serveWebSocket()
+```
+
+Run the complete example with:
+
+```sh
+nim c -r examples/websocket_server.nim
+```
+
+`newMcpWebSocketConfig` uses a 1 MiB message limit, 64 levels of JSON nesting,
+and a 10-second handshake timeout by default. Set `requestTimeoutMs` to cancel
+long-running MCP requests. Use `allowedHosts`, `allowedOrigins`, and
+`authorization` when the endpoint is reachable by untrusted clients.
+
+The built-in WebSocket server does not terminate TLS. Put it behind a trusted
+TLS reverse proxy in production. WebSocket clients must send masked text
+messages; browser WebSocket clients do this automatically.
 
 ## In-process transport
 

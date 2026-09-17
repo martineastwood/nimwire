@@ -48,6 +48,7 @@ export default defineConfig({
 						{ label: 'Overview', slug: 'examples' },
 						{ label: 'Echo server', slug: 'examples/echo-server' },
 						{ label: 'HTTP server', slug: 'examples/http-server' },
+						{ label: 'WebSocket server', slug: 'examples/websocket-server' },
 						{ label: 'Prompts server', slug: 'examples/prompts-server' },
 						{ label: 'Resources server', slug: 'examples/resources-server' },
 						{ label: 'Auth server', slug: 'examples/auth-server' },

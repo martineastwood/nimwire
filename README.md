@@ -2,8 +2,8 @@
 
 MCP server primitives for Nim.
 
-The first release targets the stable MCP `2026-07-28` revision over stdio and
-Streamable HTTP:
+The first release targets the stable MCP `2026-07-28` revision over stdio,
+Streamable HTTP, and persistent WebSocket connections:
 
 - stateless per-request metadata;
 - `server/discover`, `ping`, `tools/list`, `tools/call`, `prompts/list`, and
@@ -38,7 +38,9 @@ The implementation is split into focused modules. Import `nimwire/core` for
 protocol primitives, `nimwire/server` for registration and dispatch,
 `nimwire/resources` for resource definitions and helpers, `nimwire/prompts` for
 prompt definitions and messages, and
-`nimwire/transports/stdio` for the stdio transport. `nimwire/context` provides
+`nimwire/transports/stdio` for the stdio transport and
+`nimwire/transports/websocket` for persistent WebSocket connections.
+`nimwire/context` provides
 request-scoped handler context, `nimwire/mrtr` provides multi-round-trip input
 handling, `nimwire/auth` provides HTTP authorization hooks, `nimwire/security`
 provides reusable limits and redaction, while `nimwire/testing` provides
@@ -74,6 +76,16 @@ transport is framework-neutral: adapt a request into `McpHttpRequest`, call
 framework. `newMcpHttpServer` also provides a small stdlib
 `asynchttpserver` adapter. See [examples/reverse_proxy.conf](examples/reverse_proxy.conf)
 for a minimal deployment shape.
+
+Run the WebSocket example:
+
+```sh
+nim c -r examples/websocket_server.nim
+```
+
+It accepts masked text WebSocket messages at `ws://127.0.0.1:8080/mcp`. Each
+message contains one MCP JSON-RPC request or notification. The connection stays
+open for subsequent messages, progress notifications, and subscriptions.
 
 Raw tool handlers receive request context as their second parameter. Use an
 ignored parameter when a tool does not need it:

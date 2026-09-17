@@ -9,6 +9,7 @@ type
     mcpTransportUnknown
     mcpTransportStdio
     mcpTransportHttp
+    mcpTransportWebSocket
     mcpTransportInProcess
 
   McpTransportInfo* = object

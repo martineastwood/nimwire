@@ -22,9 +22,10 @@ import ./nimwire/subscriptions
 import ./nimwire/testing
 import ./nimwire/transports/stdio
 import ./nimwire/transports/http
+import ./nimwire/transports/websocket
 import ./nimwire/transports/inproc
 import std/jsonutils
 
 export core, context, extensions, middleware, auth, mrtr, prompts, resources, schema, security, tasks, observability, transport, composition, server, subscriptions,
-  testing, stdio, http, inproc
+  testing, stdio, http, websocket, inproc
 export fromJsonHook, toJsonHook

@@ -3,7 +3,7 @@ title: Introduction
 description: Build MCP servers in Nim with typed tools, resources, prompts, and native transports.
 ---
 
-nimwire gives you the server side of the [Model Context Protocol](https://modelcontextprotocol.io) in native Nim code. You can expose functions as tools, publish files or generated data as resources, offer reusable prompts, and serve the same application over stdio or Streamable HTTP.
+nimwire gives you the server side of the [Model Context Protocol](https://modelcontextprotocol.io) in native Nim code. You can expose functions as tools, publish files or generated data as resources, offer reusable prompts, and serve the same application over stdio, Streamable HTTP, or WebSocket.
 
 ## Your first server
 
@@ -37,7 +37,7 @@ The executable reads newline-delimited JSON-RPC messages from stdin and writes r
 - **Tools:** use typed Nim procedures and let nimwire derive their input and output schemas, or provide raw JSON when you need full schema control.
 - **Resources:** serve static text, generated data, binary contents, files, and URI templates.
 - **Prompts:** return text, media, resource links, or embedded resources from typed string arguments.
-- **Transports:** use stdio for local clients, Streamable HTTP for remote clients, or an in-process transport for composition and tests.
+- **Transports:** use stdio for local clients, Streamable HTTP or WebSocket for remote clients, or an in-process transport for composition and tests.
 - **Long-running work:** opt into MCP Tasks with expiring in-memory storage or durable storage callbacks.
 - **Production features:** add authorization, principal-based visibility, cancellation, progress, limits, request logs, metrics, and tracing hooks.
 
@@ -55,5 +55,5 @@ As the application grows, focused imports such as `nimwire/server`, `nimwire/res
 
 - [Quickstart](/guides/quickstart/): build, run, and inspect a complete stdio server.
 - [Server basics](/guides/server-basics/): register tools and understand MCP responses.
-- [Transports](/guides/transports/): choose stdio, HTTP, or in-process delivery.
+- [Transports](/guides/transports/): choose stdio, HTTP, WebSocket, or in-process delivery.
 - [Examples](/examples/): copy the runnable servers from the repository.
